@@ -1,0 +1,9 @@
+# Core stack for CMS integration (Windows today; same on Raspberry Pi per antenna).
+flask>=3.0
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+pyzmq>=25.0
+PyQt5>=5.15
+
+# GNU Radio is installed separately (system packages / conda). Not pip-installable on all platforms.

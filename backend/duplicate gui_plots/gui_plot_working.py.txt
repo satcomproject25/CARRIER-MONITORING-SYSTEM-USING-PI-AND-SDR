@@ -1,0 +1,637 @@
+﻿import zmq
+import numpy as np
+import matplotlib.pyplot as plt
+from PyQt5 import QtCore
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton, QLabel, QApplication
+from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt
+from matplotlib.animation import FuncAnimation
+from scipy.signal import get_window
+from matplotlib.widgets import CheckButtons, Button, TextBox
+from datetime import datetime
+import matplotlib
+matplotlib.use(QtAgg)   # or Qt5Agg
+
+# =========================
+# CONFIG
+# =========================
+FFT_SIZE = 2048
+
+# ---------------------------------------------------------
+# KEY SEPARATION — tree height vs how far you stand
+#
+# HW_SAMPLE_RATE = actual ADC rate from hardwaremetadata
+#   → determines df (Hz per bin) → determines REAL BW
+#   → this is the TREE'S REAL HEIGHT
+#
+# DISPLAY_BW = how much bandwidth you SHOW on screen
+#   → only controls x-axis zoom (how far you stand)
+#   → NEVER affects detection or BW calculation
+# ---------------------------------------------------------
+HW_SAMPLE_RATE = 20e6       # actual hardware rate — ONLY metadata changes this
+DISPLAY_BW = 20e6           # view bandwidth (zoom) — text box changes this
+
+HW_CENTER_FREQ = 70e6
+DISPLAY_CENTER_FREQ = 70e6
+CENTER_FREQ = 70e6
+
+ZMQ_ADDR = tcp127.0.0.15555
+ZMQ_META_ADDR = tcp127.0.0.15556
+
+# Detection params in Hz (sample-rate-invariant)  
+'''Instead of smoothing over 1 bin (which is noisy),
+you smooth over5 bins≈ 48.8 𝑘𝐻𝑧'''
+SMOOTH_BW_HZ = 5  (20e6  2048)      # ≈ 48.8 kHz
+MIN_CARRIER_BW_HZ = 5  (20e6  2048) # ≈ 48.8 kHz
+THRESHOLD_RATIO = 0.35
+
+Y_MIN = -140
+Y_MAX = 10
+
+# df always from HARDWARE rate — this is the real ruler
+df = HW_SAMPLE_RATE  FFT_SIZE
+
+# =========================
+# ZMQ SETUP
+# =========================
+ctx = zmq.Context()
+
+sock = ctx.socket(zmq.SUB)
+sock.connect(ZMQ_ADDR)
+sock.setsockopt(zmq.SUBSCRIBE, b)
+sock.setsockopt(zmq.CONFLATE, 1)
+sock.setsockopt(zmq.RCVHWM, 1)
+sock.setsockopt(zmq.LINGER, 0)
+carrier_sock = ctx.socket(zmq.SUB)
+carrier_sock.connect(tcp127.0.0.15557)
+carrier_sock.setsockopt(zmq.SUBSCRIBE, b)
+
+meta_sock = ctx.socket(zmq.SUB)
+meta_sock.connect(ZMQ_META_ADDR)
+meta_sock.setsockopt(zmq.SUBSCRIBE, b)
+
+poller = zmq.Poller()
+poller.register(sock, zmq.POLLIN)
+poller.register(meta_sock, zmq.POLLIN)
+poller.register(carrier_sock, zmq.POLLIN)
+
+
+# =========================
+# PLOT SETUP
+# =========================
+fig, ax = plt.subplots(figsize=(12, 6))
+manager = plt.get_current_fig_manager()
+manager.window.showMaximized()
+
+plt.subplots_adjust(right=0.9, bottom=0.25)
+
+def update_axis()
+    
+    freq_axis + df always use HW_SAMPLE_RATE (the truth).
+    x-axis DISPLAY limits use DISPLAY_BW (the zoom level).
+    
+    global freq_axis, df
+
+    # df from HARDWARE rate — never from display
+    df = HW_SAMPLE_RATE  FFT_SIZE
+
+    # freq_axis maps each bin to its TRUE frequency in Hz
+    freq_axis = (
+        np.arange(-FFT_SIZE  2, FFT_SIZE  2)  df
+    ) + HW_CENTER_FREQ
+
+    # x-axis limits = zoom window (how far you stand from the tree)
+    ax.set_xlim(
+        (DISPLAY_CENTER_FREQ - DISPLAY_BW  2)  1e6,
+        (DISPLAY_CENTER_FREQ + DISPLAY_BW  2)  1e6
+    )
+
+update_axis()
+
+line_live, = ax.plot(freq_axis  1e6, np.zeros(FFT_SIZE), lw=1)
+
+# HOLD LINES
+line_max, = ax.plot(freq_axis  1e6, np.zeros(FFT_SIZE), color=green, lw=1)
+line_min, = ax.plot(freq_axis  1e6, np.zeros(FFT_SIZE), color=red, lw=0.5)
+
+ax.set_ylim(Y_MIN, Y_MAX)
+
+max_hold = np.full(FFT_SIZE, -np.inf)
+min_hold = np.full(FFT_SIZE, np.inf)
+
+ax.set_xlabel(Frequency (MHz))
+ax.set_ylabel(Power (dB))
+ax.set_title(Real-Time FFT Spectrum)
+
+window = get_window(hann, FFT_SIZE)
+iq_buffer = np.zeros(FFT_SIZE, dtype=np.complex64)
+monitor_ax = plt.axes([0.02, 0.75, 0.3, 0.2])
+monitor_ax.axis(off)
+monitor_text = monitor_ax.text(
+    0.0, 1.0, ,
+    verticalalignment='top',
+    fontsize=10,
+    family='monospace'
+)
+
+# =========================
+# CONTROL PANEL
+# =========================
+enable_max_hold = False
+enable_min_hold = False
+
+rax = plt.axes([0.92, 0.65, 0.095, 0.1])
+check = CheckButtons(rax, [MAX HOLD, MIN HOLD], [False, False])
+
+def toggle(label)
+    global enable_max_hold, enable_min_hold
+    if label == MAX HOLD
+        enable_max_hold = not enable_max_hold
+    if label == MIN HOLD
+        enable_min_hold = not enable_min_hold
+
+check.on_clicked(toggle)
+
+reset_ax = plt.axes([0.92, 0.55, 0.1, 0.05])
+reset_btn = Button(reset_ax, Reset Hold)
+
+def reset(event)
+    global max_hold, min_hold
+    max_hold[] = -np.inf
+    min_hold[] = np.inf
+
+reset_btn.on_clicked(reset)
+
+# =========================
+# TEXT BOXES
+# =========================
+ax_freq = plt.axes([0.1, 0.1, 0.2, 0.05])
+tb_freq = TextBox(ax_freq, Center Freq (Hz), initial=str(CENTER_FREQ))
+
+# This is now DISPLAY bandwidth (zoom), NOT hardware rate
+ax_sr = plt.axes([0.45, 0.1, 0.15, 0.05])
+tb_sr = TextBox(ax_sr, Sample rate (Hz), initial=str(DISPLAY_BW))
+
+ax_fft = plt.axes([0.7, 0.1, 0.1, 0.05])
+tb_fft = TextBox(ax_fft, FFT, initial=str(FFT_SIZE))
+
+def update_freq(text)
+    global DISPLAY_CENTER_FREQ
+    DISPLAY_CENTER_FREQ = float(text)
+    update_axis()
+
+def update_display_bw(text)
+    
+    Only changes ZOOM level (how far you stand from the tree).
+    Does NOT change df, freq_axis, or detection — the tree's
+    real height stays the same.
+    
+    global DISPLAY_BW
+    DISPLAY_BW = float(text)
+
+    # Only update x-axis limits — nothing else changes
+    ax.set_xlim(
+        (DISPLAY_CENTER_FREQ - DISPLAY_BW  2)  1e6,
+        (DISPLAY_CENTER_FREQ + DISPLAY_BW  2)  1e6
+    )
+
+def update_fft(text)
+    global FFT_SIZE, max_hold, min_hold, window, iq_buffer
+
+    FFT_SIZE = int(text)
+
+    update_axis()
+    window = get_window(hann, FFT_SIZE)
+    iq_buffer = np.zeros(FFT_SIZE, dtype=np.complex64)
+    max_hold = np.full(FFT_SIZE, -np.inf)
+    min_hold = np.full(FFT_SIZE, np.inf)
+
+    line_live.set_xdata(freq_axis  1e6)
+    line_max.set_xdata(freq_axis  1e6)
+    line_min.set_xdata(freq_axis  1e6)
+
+tb_freq.on_submit(update_freq)
+tb_sr.on_submit(update_display_bw)
+tb_fft.on_submit(update_fft)
+
+# =====================================================
+# LOG VIEWER WINDOW (ADDITION — no existing code changed)
+# =====================================================
+MAX_LOG_LINES = 5000          # auto-trim after this many lines
+LOG_THROTTLE_SEC = 0.5        # don't log faster than every 0.5 s
+
+class LogWindow(QWidget)
+    Floating log window — openclose via View Log button.
+
+    def __init__(self, parent=None)
+        super().__init__(parent)
+        self.setWindowTitle(Carrier Detection Log)
+        self.setWindowFlags(Qt.Window  Qt.WindowMinimizeButtonHint 
+                            Qt.WindowMaximizeButtonHint  Qt.WindowCloseButtonHint)
+        self.resize(700, 420)
+
+        layout = QVBoxLayout(self)
+
+        # --- header bar ---
+        hdr = QHBoxLayout()
+        title = QLabel(CARRIER DETECTION LOG)
+        title.setFont(QFont(Segoe UI, 11, QFont.Bold))
+        hdr.addWidget(title)
+        hdr.addStretch()
+
+        self.line_count_label = QLabel(Lines 0)
+        self.line_count_label.setFont(QFont(Consolas, 9))
+        hdr.addWidget(self.line_count_label)
+
+        self.autoscroll_on = True
+        self.btn_autoscroll = QPushButton(Auto-scroll ON)
+        self.btn_autoscroll.setFixedWidth(120)
+        self.btn_autoscroll.clicked.connect(self._toggle_autoscroll)
+        hdr.addWidget(self.btn_autoscroll)
+
+        btn_clear = QPushButton(Clear)
+        btn_clear.setFixedWidth(60)
+        btn_clear.clicked.connect(self.clear_log)
+        hdr.addWidget(btn_clear)
+
+        layout.addLayout(hdr)
+
+        # --- log text area ---
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setFont(QFont(Consolas, 10))
+        self.text.setStyleSheet(
+            QTextEdit { background-color #1e1e1e; color #d4d4d4; 
+            border 1px solid #3c3c3c; }
+        )
+        layout.addWidget(self.text)
+
+        self._line_count = 0
+        self._last_log_time = 0.0
+
+    # --- public API called from update() ---
+    def append(self, msg, color=#d4d4d4)
+        self.text.setTextColor(QColor(color))
+        self.text.append(msg)
+        self._line_count += msg.count('n') + 1
+        self.line_count_label.setText(fLines {self._line_count})
+
+        # auto-trim
+        if self._line_count  MAX_LOG_LINES
+            self._trim()
+
+        if self.autoscroll_on
+            sb = self.text.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def clear_log(self)
+        self.text.clear()
+        self._line_count = 0
+        self.line_count_label.setText(Lines 0)
+
+    # --- internals ---
+    def _toggle_autoscroll(self)
+        self.autoscroll_on = not self.autoscroll_on
+        self.btn_autoscroll.setText(
+            Auto-scroll ON if self.autoscroll_on else Auto-scroll OFF
+        )
+
+    def _trim(self)
+        Keep only the last MAX_LOG_LINES2 lines.
+        doc = self.text.document()
+        cursor = self.text.textCursor()
+        cursor.movePosition(cursor.Start)
+        half = doc.blockCount()  2
+        for _ in range(half)
+            cursor.movePosition(cursor.Down, cursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.deleteChar()        # remove trailing newline
+        self._line_count = doc.blockCount()
+        self.line_count_label.setText(fLines {self._line_count})
+
+    def closeEvent(self, event)
+        Hide instead of destroy so we can reopen.
+        self.hide()
+        event.ignore()
+
+
+# Create the log window (hidden by default)
+log_win = LogWindow()
+log_win.append(
+    f[{datetime.now().strftime('%H%M%S')}] Log started    
+    fHW SR {HW_SAMPLE_RATE1e6.1f} MHz    
+    fFFT {FFT_SIZE}    
+    fCF {HW_CENTER_FREQ1e6.1f} MHz,
+    #569cd6
+)
+
+# --- View Log button on matplotlib figure ---
+log_btn_ax = plt.axes([0.92, 0.45, 0.1, 0.05])
+log_btn = Button(log_btn_ax, View Log)
+
+def toggle_log(event)
+    if log_win.isVisible()
+        log_win.hide()
+    else
+        log_win.show()
+        log_win.raise_()
+        log_win.activateWindow()
+
+log_btn.on_clicked(toggle_log)
+
+# =====================================================
+# END OF LOG VIEWER ADDITION
+# =====================================================
+
+plt.show(block=False)
+
+print([INFO] GUI running...)
+
+# =========================
+# UPDATE FUNCTION
+# =========================
+def update(frame)
+    events = dict(poller.poll(timeout=0))
+    new_data = False
+    # --------- METADATA UPDATE ----------
+    if meta_sock in events
+        meta = meta_sock.recv_json()
+
+        global HW_SAMPLE_RATE, FFT_SIZE, HW_CENTER_FREQ
+        global window, iq_buffer, max_hold, min_hold
+
+        # ONLY metadata changes the hardware rate
+        HW_SAMPLE_RATE = meta[rate]
+        FFT_SIZE = meta[fft]
+        HW_CENTER_FREQ = meta[cf]
+
+        window = get_window(hann, FFT_SIZE)
+        iq_buffer = np.zeros(FFT_SIZE, dtype=np.complex64)
+
+        max_hold = np.full(FFT_SIZE, -np.inf)
+        min_hold = np.full(FFT_SIZE, np.inf)
+
+        update_axis()
+
+        line_live.set_xdata(freq_axis  1e6)
+        line_max.set_xdata(freq_axis  1e6)
+        line_min.set_xdata(freq_axis  1e6)
+
+        # LOG metadata change event
+        log_win.append(
+            f[{datetime.now().strftime('%H%M%S')}] META UPDATE    
+            fSR {HW_SAMPLE_RATE1e6.1f} MHz    
+            fFFT {FFT_SIZE}    
+            fCF {HW_CENTER_FREQ1e6.1f} MHz,
+            #dcdcaa
+        )
+
+    if sock in events
+        data = sock.recv()
+        iq = np.frombuffer(data, dtype=np.complex64)
+
+        if len(iq) = FFT_SIZE
+            iq_buffer[] = iq[FFT_SIZE]
+            new_data = True
+    if not new_data
+        line_live.set_ydata(np.full(FFT_SIZE, Y_MIN))
+        return line_live, line_max, line_min
+
+    spectrum = np.fft.fftshift(
+        np.fft.fft(iq_buffer  window)
+    )
+    # -------------------------------------------------------------
+    # Convert FFT magnitude to dB scale.
+    #
+    # np.abs(spectrum)        → magnitude of each frequency bin
+    # log10()                 → converts to logarithmic (dB) scale
+    # 20  log10(...)         → amplitude → dB conversion
+    #
+    # + 1e-12 is a tiny safety offset to prevent log10(0).
+    # If any FFT bin magnitude is exactly 0
+    #     log10(0) → -infinity
+    # which would produce -inf values, break plotting,
+    # and destabilize threshold detection.
+    #
+    # Adding 1e-12 ensures the value is never zero
+    #     0 + 1e-12 → very small number (~ -240 dB)
+    # This does NOT affect real signals,
+    # it only protects against mathematical singularities.
+    # -------------------------------------------------------------
+    psd = 20  np.log10(np.abs(spectrum) + 1e-12)
+
+    line_live.set_ydata(psd)
+
+    # UPDATE HOLD ARRAYS
+    if enable_max_hold
+        max_hold = np.maximum(max_hold, psd)
+
+    if enable_min_hold
+        min_hold = np.minimum(min_hold, psd)
+
+    line_max.set_ydata(max_hold)
+    line_min.set_ydata(min_hold)
+
+    # Clear overlays only (keep first 3 lines)
+    for patch in ax.patches[]
+        patch.remove()
+    for txt in ax.texts[]
+        txt.remove()
+    for l in ax.lines[3]
+        l.remove()
+    if carrier_sock in events
+        carriers = carrier_sock.recv_json()
+
+        display_text = ACTIVE CARRIERSnn
+
+        if not carriers
+            display_text += None detected
+        else
+            for c in carriers
+                display_text += (
+                    fID {c['id']}n
+                    fFreq  {c['freq']1e6.3f} MHzn
+                    fBW    {c['bw']1e3.1f} kHzn
+                    fPwr   {c['power'].1f} dBn
+                    ---------------------n
+                )
+
+        monitor_text.set_text(display_text)
+
+    # =====================================================
+    # CARRIER DETECTION — SAMPLE-RATE-INVARIANT
+    # =====================================================
+    # df is ALWAYS from HW_SAMPLE_RATE (the truth).
+    # freq_axis maps bins → real Hz.
+    # Changing DISPLAY_BW only zooms — detection untouched.
+    # =====================================================
+
+
+    # -------------------------------------------------------------
+    # Determine smoothing width and minimum carrier width
+    #
+    # df = frequency resolution (Hz per FFT bin)
+    #
+    # SMOOTH_BW_HZ defines how much bandwidth (in Hz) we want
+    # to smooth across. We convert that bandwidth into number
+    # of FFT bins by dividing by df.
+    #
+    # smooth_taps = number of bins used for moving average smoothing.
+    # max(3, ...) ensures at least 3 taps (so smoothing is meaningful).
+    #  1 forces the number to be odd (required for symmetric smoothing).
+    #
+    # min_bins = minimum number of contiguous bins required
+    # to qualify as a valid carrier (prevents tiny noise spikes
+    # from being detected as signals).
+    # -------------------------------------------------------------
+    smooth_taps = max(10, int(round(SMOOTH_BW_HZ  df)))  1   # ensure odd
+    min_bins = max(2, int(round(MIN_CARRIER_BW_HZ  df)))
+    # -------------------------------------------------------------
+    # Smooth the spectrum using a moving average filter.
+    #
+    # np.ones(smooth_taps)  smooth_taps creates an averaging kernel.
+    # Convolution replaces each bin with the average of its neighbors.
+    #
+    # Purpose
+    # - Reduce random noise fluctuations
+    # - Stabilize carrier edge detection
+    # - Prevent flickering bandwidth estimates
+    #
+    # mode=same ensures output length equals input length.
+    # -------------------------------------------------------------
+    psd_s = np.convolve(
+        psd,
+        np.ones(smooth_taps)  smooth_taps,
+        mode=same
+    )
+    # -------------------------------------------------------------
+    # Estimate noise floor and peak level
+    #
+    # noise = median of smoothed spectrum
+    #   Median is used instead of mean because
+    #   - Most bins are noise
+    #   - Carrier occupies only small portion
+    #   - Median is robust to strong peaks
+    #
+    # peak = maximum value in smoothed spectrum
+    #   Represents strongest detected signal component.
+    #
+    # These two values are later used to compute a detection threshold.
+    # -------------------------------------------------------------
+    noise = np.median(psd_s)
+    peak = np.max(psd_s)
+    
+    threshold = noise + THRESHOLD_RATIO  (peak - noise)
+
+    above = psd_s  threshold
+    edges = np.diff(above.astype(np.int8))
+
+    rises = np.where(edges == 1)[0]
+    falls = np.where(edges == -1)[0]
+
+    # Proper risefall pairing for edge cases
+    if len(falls)  0 and (len(rises) == 0 or falls[0]  rises[0])
+        rises = np.insert(rises, 0, 0)
+    if len(rises)  0 and (len(falls) == 0 or rises[-1]  falls[-1])
+        falls = np.append(falls, FFT_SIZE - 1)
+
+    # LOG collect detected carriers this frame for logging
+    import time
+    now = time.time()
+    log_this_frame = (now - log_win._last_log_time) = LOG_THROTTLE_SEC
+    carrier_id = 0
+    GREEN_SHADES = [
+    #4ec9b0,
+    #6abf69,
+    #98e898,
+    #00ff7f,
+    #b2fab4,
+    ]
+
+    for r, f in zip(rises, falls)
+
+        bins = f - r
+        if bins  min_bins
+            continue
+
+        # BW from freq_axis (which uses HW_SAMPLE_RATE) — the REAL ruler
+        f_start = freq_axis[r]
+        f_stop = freq_axis[min(f, FFT_SIZE - 1)]
+
+        bw = f_stop - f_start
+        f_center = 0.5  (f_start + f_stop)
+
+        # peak power within this carrier
+        carrier_peak_pwr = np.max(psd[rf+1])
+
+
+
+
+
+        # integrated carrier power (true total power)
+        lin_power = np.sum(10  (psd[rf+1]  10))
+        carrier_total_power_db = 10  np.log10(lin_power + 1e-12)
+
+
+
+        bins_in_carrier = f - r + 1
+        noise_linear = np.median(10(psd10))
+        noise_total_linear = noise_linear  bins_in_carrier
+        noise_total_db = 10np.log10(noise_total_linear)
+        cn_db = carrier_total_power_db - noise_total_db
+
+
+
+
+        ax.axvspan(f_start  1e6, f_stop  1e6,
+                   color=orange, alpha=0.25)
+
+        ax.axvline(f_start  1e6, color=green)
+        ax.axvline(f_stop  1e6, color=red)
+
+        ax.text(
+            f_center  1e6,
+            Y_MAX - 5,
+            f{bw1e3.0f} kHz,
+            ha=center,
+            va=top,
+            bbox=dict(boxstyle=round, fc=white, alpha=0.8)
+        )
+
+        # LOG append carrier detection entry (throttled)
+        carrier_id += 1
+        if log_this_frame and log_win.isVisible()
+            color = GREEN_SHADES[(carrier_id - 1) % len(GREEN_SHADES)]
+
+            log_win.append(
+                f[{datetime.now().strftime('%H%M%S.%f')[-3]}] 
+                fCarrier {carrier_id}    
+                fFreq {f_center1e6.3f} MHz    
+                fTotal Power {carrier_total_power_db.1f} dB    
+                fBW {bw1e3.1f} kHz    
+                fPeak {carrier_peak_pwr.1f} dB    
+                fNoise {noise.1f} dB    
+                fRange {f_start1e6.3f}–{f_stop1e6.3f} MHz 
+                fCN{cn_db.2f}db ,
+                color
+            )
+
+    # LOG if no carriers detected, log that too (throttled)
+    if carrier_id == 0 and log_this_frame and log_win.isVisible()
+        log_win.append(
+            f[{datetime.now().strftime('%H%M%S.%f')[-3]}] 
+            fNo carriers    Noise {noise.1f} dB    Threshold {threshold.1f} dB,
+            #808080
+        )
+
+    if log_this_frame
+        log_win._last_log_time = now
+
+    return line_live, line_max, line_min
+
+# =========================
+# START ANIMATION
+# =========================
+ani = FuncAnimation(fig, update, interval=40, cache_frame_data=False)
+
+plt.show()
