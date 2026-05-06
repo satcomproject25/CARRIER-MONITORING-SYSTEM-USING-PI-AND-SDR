@@ -1,24 +1,9 @@
 {
   "gsat-30": [
     {
-      "center": 67500000.0,
-      "bandwidth": 500000.0,
-      "label": "Carrier @ 67.5 MHz"
-    },
-    {
-      "center": 67000000.0,
-      "bandwidth": 500000.0,
-      "label": "Carrier @ 67 MHz"
-    },
-    {
-      "center": 62500000.0,
-      "bandwidth": 500000.0,
-      "label": ""
-    },
-    {
       "center": 72000000.0,
       "bandwidth": 500000.0,
-      "label": "Carrier @ 72 MHz"
+      "label": ""
     },
     {
       "center": 70000000.0,
@@ -26,22 +11,17 @@
       "label": ""
     },
     {
-      "center": 62500000.0,
+      "center": 65200000.0,
       "bandwidth": 500000.0,
       "label": ""
     },
     {
-      "center": 62100000.0,
+      "center": 72800000.0,
       "bandwidth": 500000.0,
       "label": ""
     },
     {
-      "center": 62100000.0,
-      "bandwidth": 500000.0,
-      "label": ""
-    },
-    {
-      "center": 75000000.0,
+      "center": 74800000.0,
       "bandwidth": 500000.0,
       "label": ""
     }

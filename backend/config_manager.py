@@ -117,6 +117,7 @@ class AuthorizedFrequencyManager:
         self._port = port
         self._active_antenna = _normalize_antenna_id(active_antenna)
         self._frequencies_by_antenna: dict[str, list[dict[str, Any]]] = {}
+        self._file_mtime: float = 0.0
         self._load()
         if auto_start and FLASK_AVAILABLE:
             self._start_web_server()
@@ -136,8 +137,10 @@ class AuthorizedFrequencyManager:
     def _load(self):
         if not os.path.exists(_CONFIG_FILE):
             self._frequencies_by_antenna = {_DEFAULT_ANTENNA: []}
+            self._file_mtime = 0.0
             return
         try:
+            self._file_mtime = os.path.getmtime(_CONFIG_FILE)
             with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             if isinstance(payload, list):
@@ -154,16 +157,27 @@ class AuthorizedFrequencyManager:
             print(f"[CONFIG] Failed to load {_CONFIG_FILE}: {exc}")
             self._frequencies_by_antenna = {_DEFAULT_ANTENNA: []}
 
+    def _reload_if_changed(self):
+        """Reload from disk if the file has been modified by another process."""
+        try:
+            mtime = os.path.getmtime(_CONFIG_FILE) if os.path.exists(_CONFIG_FILE) else 0.0
+        except OSError:
+            return
+        if mtime != self._file_mtime:
+            self._load()
+
     def _save(self):
         try:
             with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._frequencies_by_antenna, f, indent=2)
+            self._file_mtime = os.path.getmtime(_CONFIG_FILE)
         except Exception as exc:
             print(f"[CONFIG] Save error: {exc}")
 
     def is_authorized(self, freq_hz: float, antenna_id: str | None = None) -> bool:
         aid = _normalize_antenna_id(antenna_id or self.get_active_antenna())
         with self._lock:
+            self._reload_if_changed()
             for entry in self._frequencies_by_antenna.get(aid, []):
                 c = entry["center"]
                 half_bw = entry["bandwidth"] / 2.0
@@ -174,6 +188,7 @@ class AuthorizedFrequencyManager:
     def get_all(self, antenna_id: str | None = None) -> list[dict]:
         aid = _normalize_antenna_id(antenna_id or self.get_active_antenna())
         with self._lock:
+            self._reload_if_changed()
             return list(self._frequencies_by_antenna.get(aid, []))
 
     def add(self, center_hz: float, bandwidth_hz: float, label: str = "", antenna_id: str | None = None):

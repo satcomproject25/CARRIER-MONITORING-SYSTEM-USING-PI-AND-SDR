@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import threading
 import time
@@ -1908,11 +1908,6 @@ def update():
     _all_gap_dets    = []   # gap interference detections
     _all_carrier_dets = []  # carrier detections
 
-    # Increment frame counter ONCE per frame (not per carrier) so the
-    # ConfidenceEngine vote buffer and DetectionTracker debounce age correctly.
-    global _frame_counter
-    _frame_counter += 1
-
     for rec in render_records:
         r, f = int(rec['r']), int(rec['f'])
         if (f - r) < min_bins:
@@ -2004,6 +1999,8 @@ def update():
             intf_hits   = detect_interference_in_carrier(psd_s[r:f+1], freq_axis[r:f+1])
             gap_hits    = [h for h in intf_hits if h.get('is_gap', False)]
             nongap_hits = [h for h in intf_hits if not h.get('is_gap', False)]
+        global _frame_counter
+        _frame_counter += 1
         intf_hits = _conf.augment(
             psd_raw=psd, display_psd=display_psd,
             carrier_span=(r, f), carrier_cf=f_center,
@@ -2379,8 +2376,6 @@ def update():
         for _si in _intf_stable:
             _intf_s.append({
                 "center_mhz": _j(_si["center_freq"]) / 1e6,
-                "start_mhz": _j(_si.get("ids", _si["center_freq"] - 100e3)) / 1e6,
-                "end_mhz": _j(_si.get("ide", _si["center_freq"] + 100e3)) / 1e6,
                 "strength_db": _j(_si["strength_db"]),
                 "method": _si.get("method", ""),
                 "classification": _si.get("classification", ""),
@@ -2392,8 +2387,6 @@ def update():
         for _gs in _gap_stable:
             _gap_s.append({
                 "center_mhz": _j(_gs["center_freq"]) / 1e6,
-                "start_mhz": _j(_gs.get("gs", _gs["center_freq"] - 100e3)) / 1e6,
-                "end_mhz": _j(_gs.get("ge", _gs["center_freq"] + 100e3)) / 1e6,
                 "strength_db": _j(_gs["strength_db"]),
                 "method": _gs.get("method", ""),
                 "confidence": _j(_gs.get("confidence", 0)),
