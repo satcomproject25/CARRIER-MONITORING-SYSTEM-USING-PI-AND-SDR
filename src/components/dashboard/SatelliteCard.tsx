@@ -5,9 +5,12 @@ import { useAppStore } from '@/store/appStore';
 
 interface Props { satellite: SatType; index: number; }
 
+const LIVE_MONITOR_NAME = 'GSAT-30';
+
 export const SatelliteCard = ({ satellite, index }: Props) => {
   const { selectSatellite, setMonitoringSatellite } = useAppStore();
   const isOnline = satellite.status === 'online';
+  const canMonitorLive = satellite.name === LIVE_MONITOR_NAME && isOnline;
 
   return (
     <div className="glass-card p-5 hover:border-primary/30 transition-all duration-300 group animate-fade-in"
@@ -64,7 +67,8 @@ export const SatelliteCard = ({ satellite, index }: Props) => {
           <Eye className="w-3 h-3 mr-1.5" /> View Details
         </Button>
         <Button size="sm" className="flex-1 text-xs h-8 glow-primary hover:scale-[1.02] active:scale-[0.98] transition-transform"
-          onClick={() => setMonitoringSatellite(satellite)} disabled={!isOnline}>
+          onClick={() => setMonitoringSatellite(satellite)} disabled={!canMonitorLive}
+          title={!canMonitorLive ? 'Live monitoring is only available for GSAT-30 on this deployment.' : undefined}>
           <Activity className="w-3 h-3 mr-1.5" /> Monitor
         </Button>
       </div>

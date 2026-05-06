@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { Satellite, Shield, Eye, EyeOff } from 'lucide-react';
+import { Shield, Eye, EyeOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { SignupModal } from './SignupModal';
 import { useAppStore } from '@/store/appStore';
+import isroLogo from '../../../image/isro_dark.png';
 
 export const LoginPage = () => {
   const [email, setEmail] = useState('');
@@ -42,9 +43,11 @@ export const LoginPage = () => {
         <div className="glass-panel p-8 animate-scale-in">
           {/* ISRO Logo */}
           <div className="flex flex-col items-center mb-8">
-            <div className="w-16 h-16 rounded-2xl bg-primary/10 border border-primary/30 flex items-center justify-center mb-4 glow-primary">
-              <Satellite className="w-8 h-8 text-primary" />
-            </div>
+            <img
+              src={isroLogo}
+              alt="ISRO"
+              className="h-20 w-auto object-contain mb-4"
+            />
             <h1 className="text-2xl font-bold text-gradient">ISRO CMS</h1>
             <p className="text-muted-foreground text-sm mt-1">Carrier Monitoring System</p>
           </div>

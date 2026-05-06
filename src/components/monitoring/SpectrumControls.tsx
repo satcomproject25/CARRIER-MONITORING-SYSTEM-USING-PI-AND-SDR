@@ -55,6 +55,9 @@ export const SpectrumControls = ({
               onValueChange={([v]) => setSmoothAlpha(v / 100)}
               className="w-full"
             />
+            <p className="text-[9px] font-mono text-muted-foreground mt-1">
+              Temporal EMA across display frames. α=0 raw, α=1 max persistence.
+            </p>
           </div>
         )}
 

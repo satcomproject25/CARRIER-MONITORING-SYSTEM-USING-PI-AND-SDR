@@ -26,18 +26,18 @@ export const DSP_CONFIG = {
   SMOOTH_BW_HZ: 5 * (20e6 / 2048),
   THRESHOLD_RATIO: 0.35,
 
-  // Interference detection
+  // Interference detection — must match backend Interference.py exactly
   INTF_BUMP_THRESHOLD_DB: 2,
-  INTF_MIN_BUMP_BINS: 1.5,
-  INTF_ENVELOPE_ORDER: 15,
+  INTF_MIN_BUMP_BINS: 1.0,       // backend: INTF_MIN_BUMP_BINS = 1.0
+  INTF_ENVELOPE_ORDER: 9,        // backend: INTF_ENVELOPE_ORDER = 9
   INTF_VARIANCE_WINDOW: 7,
   INTF_VARIANCE_SIGMA: 2.5,
   INTF_CUC_CURV_SIGMA: 3.5,
   INTF_MERGE_GAP_HZ: 200e3,
 
-  // Gap detection
+  // Gap detection — must match backend exactly
   GAP_DEPTH_DB: 2.5,
-  GAP_MIN_BINS: 32,
+  GAP_MIN_BINS: 3,               // backend: GAP_MIN_BINS = 3 (was wrongly 32)
 
   // Valley detection
   VALLEY_DEPTH_DB: 3.0,

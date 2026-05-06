@@ -1,6 +1,7 @@
-import { Satellite, LogOut, Radio, Bell } from 'lucide-react';
+import { LogOut, Radio, Bell } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store/appStore';
+import isroLogo from '../../../image/isro_dark.png';
 
 export const DashboardHeader = () => {
   const { auth, logout, satellites } = useAppStore();
@@ -11,9 +12,11 @@ export const DashboardHeader = () => {
       <div className="flex items-center justify-between px-6 py-3">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-primary/10 border border-primary/30 flex items-center justify-center">
-              <Satellite className="w-5 h-5 text-primary" />
-            </div>
+            <img
+              src={isroLogo}
+              alt="ISRO"
+              className="h-10 w-auto object-contain"
+            />
             <div>
               <h1 className="text-sm font-bold text-gradient leading-tight">ISRO CMS</h1>
               <p className="text-[10px] text-muted-foreground font-mono">CARRIER MONITORING</p>

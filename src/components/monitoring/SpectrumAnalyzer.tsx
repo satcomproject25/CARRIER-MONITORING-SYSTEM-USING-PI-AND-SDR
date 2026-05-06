@@ -134,17 +134,16 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
     ctx.textAlign = 'left';
     ctx.fillText('Real-Time FFT Spectrum + Carrier Detection', margin.left, 18);
 
-    // Draw carrier highlights (green spans)
+    // Carrier highlights — authorized: green; unauthorized / unauth hits: red
     for (const carrier of data.carriers) {
       const x1 = freqToX(carrier.startFreq);
       const x2 = freqToX(carrier.endFreq);
+      const auth = carrier.isAuthorized !== false;
 
-      // Green fill
-      ctx.fillStyle = 'rgba(34, 197, 94, 0.2)';
+      ctx.fillStyle = auth ? 'rgba(34, 197, 94, 0.2)' : 'rgba(239, 68, 68, 0.28)';
       ctx.fillRect(x1, margin.top, x2 - x1, plotH);
 
-      // Orange boundary lines
-      ctx.strokeStyle = 'rgba(249, 115, 22, 0.8)';
+      ctx.strokeStyle = auth ? 'rgba(249, 115, 22, 0.8)' : 'rgba(248, 113, 113, 0.9)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(x1, margin.top);
@@ -155,19 +154,16 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
       ctx.lineTo(x2, margin.top + plotH);
       ctx.stroke();
 
-      // Label
       const cx = (x1 + x2) / 2;
       const bwKHz = carrier.bandwidth / 1e3;
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
       ctx.font = '9px JetBrains Mono, monospace';
       ctx.textAlign = 'center';
 
-      // Background for label
-      const labelText = `${bwKHz.toFixed(0)} kHz`;
+      const labelText = auth ? `${bwKHz.toFixed(0)} kHz` : `UNAUTH ${bwKHz.toFixed(0)} kHz`;
       const labelW = ctx.measureText(labelText).width + 8;
-      ctx.fillStyle = 'rgba(34, 197, 94, 0.85)';
+      ctx.fillStyle = auth ? 'rgba(34, 197, 94, 0.85)' : 'rgba(239, 68, 68, 0.9)';
       ctx.fillRect(cx - labelW / 2, margin.top + 3, labelW, 14);
-      ctx.fillStyle = '#000';
+      ctx.fillStyle = auth ? '#000' : '#fff';
       ctx.fillText(labelText, cx, margin.top + 13);
     }
 
