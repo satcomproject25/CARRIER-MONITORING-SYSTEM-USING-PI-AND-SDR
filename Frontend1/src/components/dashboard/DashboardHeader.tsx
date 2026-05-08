@@ -1,11 +1,48 @@
-import { LogOut, Radio, Bell } from 'lucide-react';
+import { useState } from 'react';
+import { LogOut, Radio, Bell, Settings, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store/appStore';
+import { SettingsPanel } from './SettingsPanel';
+import { checkMultipleSatellitesHealth } from '@/lib/healthCheck';
+import { toast } from 'sonner';
 import isroLogo from '../../../image/isro_dark.png';
 
 export const DashboardHeader = () => {
-  const { auth, logout, satellites } = useAppStore();
+  const { auth, logout, satellites, updateSatellite } = useAppStore();
+  const [showSettings, setShowSettings] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const onlineCount = satellites.filter(s => s.status === 'online').length;
+
+  const handleRefreshAllStatus = async () => {
+    setRefreshing(true);
+    toast.info('Checking all satellites...');
+
+    try {
+      const healthResults = await checkMultipleSatellitesHealth(satellites);
+      
+      let updatedCount = 0;
+      healthResults.forEach((isHealthy, satId) => {
+        const satellite = satellites.find(s => s.id === satId);
+        if (satellite) {
+          const newStatus = isHealthy ? 'online' : 'offline';
+          if (satellite.status !== newStatus) {
+            updateSatellite({ ...satellite, status: newStatus });
+            updatedCount++;
+          }
+        }
+      });
+
+      if (updatedCount > 0) {
+        toast.success(`Updated ${updatedCount} satellite status(es)`);
+      } else {
+        toast.success('All statuses are up to date');
+      }
+    } catch (error) {
+      toast.error('Failed to refresh statuses');
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   return (
     <header className="glass-panel rounded-none border-x-0 border-t-0 sticky top-0 z-40">
@@ -31,6 +68,21 @@ export const DashboardHeader = () => {
         </div>
 
         <div className="flex items-center gap-3">
+          <button 
+            className={`p-2 rounded-lg hover:bg-secondary/50 transition-colors ${refreshing ? 'animate-pulse' : ''}`}
+            onClick={handleRefreshAllStatus}
+            disabled={refreshing}
+            title="Refresh all satellite statuses"
+          >
+            <RefreshCw className={`w-4 h-4 text-muted-foreground ${refreshing ? 'animate-spin' : ''}`} />
+          </button>
+          <button 
+            className="p-2 rounded-lg hover:bg-secondary/50 transition-colors"
+            onClick={() => setShowSettings(true)}
+            title="Data Management"
+          >
+            <Settings className="w-4 h-4 text-muted-foreground" />
+          </button>
           <button className="relative p-2 rounded-lg hover:bg-secondary/50 transition-colors">
             <Bell className="w-4 h-4 text-muted-foreground" />
             <span className="absolute top-1 right-1 w-2 h-2 bg-destructive rounded-full" />
@@ -46,6 +98,8 @@ export const DashboardHeader = () => {
           </Button>
         </div>
       </div>
+
+      <SettingsPanel open={showSettings} onClose={() => setShowSettings(false)} />
     </header>
   );
 };

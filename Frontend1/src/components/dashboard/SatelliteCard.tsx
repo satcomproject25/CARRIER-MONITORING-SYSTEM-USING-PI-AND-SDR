@@ -1,16 +1,50 @@
 import { Satellite as SatType } from '@/types/satellite';
-import { Radio, Eye, Activity, MapPin } from 'lucide-react';
+import { Radio, Eye, Activity, MapPin, Settings } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store/appStore';
 
-interface Props { satellite: SatType; index: number; }
+interface SatelliteMetrics {
+  signalHealth: number;
+  cnRatio: number;
+  ebNo: number;
+  noiseFloor?: number;
+  lastUpdate?: number;
+}
 
-const LIVE_MONITOR_NAME = 'GSAT-30';
+interface Props { 
+  satellite: SatType; 
+  index: number;
+  liveMetrics?: SatelliteMetrics | null;
+}
 
-export const SatelliteCard = ({ satellite, index }: Props) => {
-  const { selectSatellite, setMonitoringSatellite } = useAppStore();
+export const SatelliteCard = ({ satellite, index, liveMetrics }: Props) => {
+  const { selectSatellite, setMonitoringSatellite, setEditingSatellite } = useAppStore();
   const isOnline = satellite.status === 'online';
-  const canMonitorLive = satellite.name === LIVE_MONITOR_NAME && isOnline;
+  
+  // Allow monitoring for any satellite that is online and has a valid Pi IP
+  const hasValidIp = satellite.piIpAddress && satellite.piIpAddress !== '—' && !satellite.piIpAddress.includes('(');
+  const canMonitor = isOnline && hasValidIp;
+
+  // Use live metrics if available, otherwise fall back to stored values
+  // For offline satellites or those without valid IP, show "—"
+  const shouldShowLiveMetrics = isOnline && hasValidIp;
+  
+  const displayMetrics = shouldShowLiveMetrics && liveMetrics ? {
+    signalHealth: liveMetrics.signalHealth,
+    cnRatio: liveMetrics.cnRatio,
+    ebNo: liveMetrics.ebNo,
+  } : {
+    signalHealth: satellite.signalHealth,
+    cnRatio: satellite.cnRatio,
+    ebNo: satellite.ebNo,
+  };
+
+  // Format display values - show "—" for offline or invalid
+  const formatMetric = (value: number | undefined, suffix: string = '') => {
+    if (!shouldShowLiveMetrics) return '—';
+    if (value === undefined || value === null || !isFinite(value)) return '—';
+    return `${value}${suffix}`;
+  };
 
   return (
     <div className="glass-card p-5 hover:border-primary/30 transition-all duration-300 group animate-fade-in"
@@ -40,17 +74,25 @@ export const SatelliteCard = ({ satellite, index }: Props) => {
       <div className="grid grid-cols-3 gap-2 mb-4">
         <div className="bg-secondary/30 rounded-md p-2 text-center">
           <p className="text-[9px] text-muted-foreground uppercase">Health</p>
-          <p className={`text-sm font-mono font-bold ${satellite.signalHealth > 70 ? 'text-success' : satellite.signalHealth > 30 ? 'text-warning' : 'text-destructive'}`}>
-            {satellite.signalHealth}%
+          <p className={`text-sm font-mono font-bold ${
+            !shouldShowLiveMetrics || !liveMetrics ? 'text-muted-foreground' :
+            displayMetrics.signalHealth > 70 ? 'text-success' : 
+            displayMetrics.signalHealth > 30 ? 'text-warning' : 'text-destructive'
+          }`}>
+            {formatMetric(displayMetrics.signalHealth, '%')}
           </p>
         </div>
         <div className="bg-secondary/30 rounded-md p-2 text-center">
           <p className="text-[9px] text-muted-foreground uppercase">C/N</p>
-          <p className="text-sm font-mono font-bold text-foreground">{satellite.cnRatio}<span className="text-[9px] text-muted-foreground">dB</span></p>
+          <p className={`text-sm font-mono font-bold ${!shouldShowLiveMetrics || !liveMetrics ? 'text-muted-foreground' : 'text-foreground'}`}>
+            {formatMetric(displayMetrics.cnRatio)}<span className="text-[9px] text-muted-foreground">{shouldShowLiveMetrics && liveMetrics ? 'dB' : ''}</span>
+          </p>
         </div>
         <div className="bg-secondary/30 rounded-md p-2 text-center">
           <p className="text-[9px] text-muted-foreground uppercase">Eb/No</p>
-          <p className="text-sm font-mono font-bold text-foreground">{satellite.ebNo}<span className="text-[9px] text-muted-foreground">dB</span></p>
+          <p className={`text-sm font-mono font-bold ${!shouldShowLiveMetrics || !liveMetrics ? 'text-muted-foreground' : 'text-foreground'}`}>
+            {formatMetric(displayMetrics.ebNo)}<span className="text-[9px] text-muted-foreground">{shouldShowLiveMetrics && liveMetrics ? 'dB' : ''}</span>
+          </p>
         </div>
       </div>
 
@@ -62,13 +104,18 @@ export const SatelliteCard = ({ satellite, index }: Props) => {
 
       {/* Actions */}
       <div className="flex gap-2">
+        <Button variant="ghost" size="sm" className="h-8 w-8 p-0 border-border/40 hover:border-primary/50 hover:bg-primary/5"
+          onClick={() => setEditingSatellite(satellite)}
+          title="Edit satellite details">
+          <Settings className="w-3.5 h-3.5" />
+        </Button>
         <Button variant="outline" size="sm" className="flex-1 text-xs h-8 border-border/40 hover:border-primary/50 hover:bg-primary/5"
           onClick={() => selectSatellite(satellite)}>
-          <Eye className="w-3 h-3 mr-1.5" /> View Details
+          <Eye className="w-3 h-3 mr-1.5" /> Details
         </Button>
         <Button size="sm" className="flex-1 text-xs h-8 glow-primary hover:scale-[1.02] active:scale-[0.98] transition-transform"
-          onClick={() => setMonitoringSatellite(satellite)} disabled={!canMonitorLive}
-          title={!canMonitorLive ? 'Live monitoring is only available for GSAT-30 on this deployment.' : undefined}>
+          onClick={() => setMonitoringSatellite(satellite)} disabled={!canMonitor}
+          title={!canMonitor ? (isOnline ? 'No valid Pi IP address configured' : 'Satellite is offline') : 'Start live monitoring'}>
           <Activity className="w-3 h-3 mr-1.5" /> Monitor
         </Button>
       </div>

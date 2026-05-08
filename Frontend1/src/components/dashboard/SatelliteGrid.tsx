@@ -3,10 +3,14 @@ import { useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { useAppStore } from '@/store/appStore';
 import { SatelliteCard } from './SatelliteCard';
+import { useSatelliteMetrics } from '@/hooks/useSatelliteMetrics';
 
 export const SatelliteGrid = () => {
   const { satellites, setShowAddModal } = useAppStore();
   const [search, setSearch] = useState('');
+  
+  // Fetch real-time metrics for all satellites
+  const { metrics } = useSatelliteMetrics(satellites, 5000); // Update every 5 seconds
 
   const filtered = satellites.filter(s =>
     s.name.toLowerCase().includes(search.toLowerCase()) ||
@@ -34,7 +38,12 @@ export const SatelliteGrid = () => {
       {/* Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
         {filtered.map((sat, i) => (
-          <SatelliteCard key={sat.id} satellite={sat} index={i} />
+          <SatelliteCard 
+            key={sat.id} 
+            satellite={sat} 
+            index={i}
+            liveMetrics={metrics.get(sat.id)}
+          />
         ))}
       </div>
 

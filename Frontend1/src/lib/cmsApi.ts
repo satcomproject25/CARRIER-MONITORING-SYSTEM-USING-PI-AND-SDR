@@ -1,9 +1,33 @@
 /**
  * CMS backend (Python orchestrator + headless Interference.py) API client.
- * Proxied via Vite to http://127.0.0.1:8780 in development.
+ * Supports both local proxy (for development) and direct IP connection (for production/remote Pi).
  */
 
 import type { DetectionResult, CarrierDetection, InterferenceDetection } from '@/lib/dspEngine';
+
+// Global variable to store the current Pi IP address
+let currentPiIp: string | null = null;
+
+/**
+ * Set the Raspberry Pi IP address for API calls.
+ * If set to null or "127.0.0.1", uses the Vite proxy (/api).
+ * Otherwise, makes direct calls to http://PI_IP:8780/api
+ */
+export function setApiTarget(piIpAddress: string | null) {
+  currentPiIp = piIpAddress;
+}
+
+/**
+ * Get the base URL for API calls based on current Pi IP.
+ */
+function getApiBaseUrl(): string {
+  // If no IP set, or localhost, or dash (simulation mode), use proxy
+  if (!currentPiIp || currentPiIp === '127.0.0.1' || currentPiIp === '—' || currentPiIp === 'localhost') {
+    return '/api'; // Use Vite proxy
+  }
+  // Direct connection to remote Pi
+  return `http://${currentPiIp}:8780/api`;
+}
 
 export type CmsSnapshot = {
   ts?: number;
@@ -65,7 +89,8 @@ export type AuthorizedFrequency = {
 };
 
 export async function cmsStartMonitor(startSdr = true, antennaId = 'gsat-30'): Promise<Response> {
-  return fetch('/api/monitor/start', {
+  const baseUrl = getApiBaseUrl();
+  return fetch(`${baseUrl}/monitor/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ start_sdr: startSdr, sdr_settle_s: 2.0, antenna_id: antennaId }),
@@ -73,7 +98,8 @@ export async function cmsStartMonitor(startSdr = true, antennaId = 'gsat-30'): P
 }
 
 export async function cmsStopMonitor(stopSdr = true): Promise<Response> {
-  return fetch('/api/monitor/stop', {
+  const baseUrl = getApiBaseUrl();
+  return fetch(`${baseUrl}/monitor/stop`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ stop_sdr: stopSdr }),
@@ -81,14 +107,16 @@ export async function cmsStopMonitor(stopSdr = true): Promise<Response> {
 }
 
 export async function cmsFetchSnapshot(): Promise<CmsSnapshot> {
-  const r = await fetch('/api/snapshot');
+  const baseUrl = getApiBaseUrl();
+  const r = await fetch(`${baseUrl}/snapshot`);
   const j = (await r.json()) as CmsSnapshot;
   if (!r.ok) j.error = j.error ?? `HTTP ${r.status}`;
   return j;
 }
 
 export async function cmsSetSmoothing(smoothEnabled: boolean, smoothAlpha: number): Promise<void> {
-  await fetch('/api/set_smoothing', {
+  const baseUrl = getApiBaseUrl();
+  await fetch(`${baseUrl}/set_smoothing`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ smooth_enabled: smoothEnabled, smooth_alpha: smoothAlpha }),
@@ -100,7 +128,8 @@ export async function cmsHealth(): Promise<{
   sdr_running: boolean;
   detector_running: boolean;
 }> {
-  const r = await fetch('/api/health');
+  const baseUrl = getApiBaseUrl();
+  const r = await fetch(`${baseUrl}/health`);
   return r.json() as Promise<{
     status: string;
     sdr_running: boolean;
@@ -109,7 +138,8 @@ export async function cmsHealth(): Promise<{
 }
 
 export async function cmsGetAuthorizedFrequencies(antennaId: string): Promise<AuthorizedFrequency[]> {
-  const r = await fetch(`/api/frequencies?antenna_id=${encodeURIComponent(antennaId)}`);
+  const baseUrl = getApiBaseUrl();
+  const r = await fetch(`${baseUrl}/frequencies?antenna_id=${encodeURIComponent(antennaId)}`);
   const j = (await r.json()) as { frequencies?: AuthorizedFrequency[] };
   return j.frequencies ?? [];
 }
@@ -120,7 +150,8 @@ export async function cmsAddAuthorizedFrequency(
   bandwidthHz: number,
   label: string,
 ): Promise<void> {
-  await fetch('/api/frequencies', {
+  const baseUrl = getApiBaseUrl();
+  await fetch(`${baseUrl}/frequencies`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -133,7 +164,8 @@ export async function cmsAddAuthorizedFrequency(
 }
 
 export async function cmsDeleteAuthorizedFrequency(antennaId: string, index: number): Promise<void> {
-  await fetch(`/api/frequencies/${index}?antenna_id=${encodeURIComponent(antennaId)}`, {
+  const baseUrl = getApiBaseUrl();
+  await fetch(`${baseUrl}/frequencies/${index}?antenna_id=${encodeURIComponent(antennaId)}`, {
     method: 'DELETE',
   });
 }

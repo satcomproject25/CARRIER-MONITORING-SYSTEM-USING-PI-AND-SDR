@@ -1,8 +1,9 @@
-import { X, MapPin, Cpu, User, Compass, Radio, Wifi } from 'lucide-react';
+import { X, MapPin, Cpu, User, Compass, Radio, Wifi, Edit } from 'lucide-react';
 import { useAppStore } from '@/store/appStore';
+import { Button } from '@/components/ui/button';
 
 export const DetailPanel = () => {
-  const { selectedSatellite: sat, setShowDetailPanel } = useAppStore();
+  const { selectedSatellite: sat, setShowDetailPanel, setEditingSatellite } = useAppStore();
   if (!sat) return null;
 
   const isOnline = sat.status === 'online';
@@ -18,6 +19,11 @@ export const DetailPanel = () => {
     { icon: Wifi, label: 'Pi IP', value: sat.piIpAddress },
   ];
 
+  const handleEdit = () => {
+    setEditingSatellite(sat);
+    setShowDetailPanel(false);
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={() => setShowDetailPanel(false)}>
       <div className="absolute inset-0 bg-background/60 backdrop-blur-sm" />
@@ -32,9 +38,15 @@ export const DetailPanel = () => {
                 <span className="text-xs font-mono text-muted-foreground">{sat.status.toUpperCase()} • {sat.band}</span>
               </div>
             </div>
-            <button onClick={() => setShowDetailPanel(false)} className="text-muted-foreground hover:text-foreground">
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={handleEdit}>
+                <Edit className="w-4 h-4 mr-1.5" />
+                Edit
+              </Button>
+              <button onClick={() => setShowDetailPanel(false)} className="text-muted-foreground hover:text-foreground">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
 
           {/* Signal Status Bar */}

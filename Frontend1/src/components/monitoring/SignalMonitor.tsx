@@ -17,15 +17,17 @@ import {
   cmsHealth,
   cmsSetSmoothing,
   snapshotToDetectionResult,
+  setApiTarget,
 } from '@/lib/cmsApi';
 import { exportSignalData } from '@/lib/exportData';
 import { SignalData } from '@/types/satellite';
 
-const LIVE_MONITOR_NAME = 'GSAT-30';
-
 export const SignalMonitor = () => {
   const { monitoringSatellite: sat, setMonitoringSatellite } = useAppStore();
-  const isLiveBackend = sat?.name === LIVE_MONITOR_NAME;
+  
+  // Determine if this is a live backend (has valid Pi IP) or simulation mode
+  const hasValidIp = sat?.piIpAddress && sat.piIpAddress !== '—' && !sat.piIpAddress.includes('(');
+  const isLiveBackend = hasValidIp;
 
   const [piConnected, setPiConnected] = useState(false);
   const [detectionResult, setDetectionResult] = useState<DetectionResult | null>(null);
@@ -55,11 +57,17 @@ export const SignalMonitor = () => {
 
   useEffect(() => {
     if (!isLiveBackend || !sat) return;
+    
+    // Set the API target to the satellite's Pi IP address
+    setApiTarget(sat.piIpAddress);
+    
     void cmsStartMonitor(true, antennaId).catch(() => undefined);
     return () => {
       void cmsStopMonitor(true);
       maxHoldRef.current = null;
       minHoldRef.current = null;
+      // Reset API target when unmounting
+      setApiTarget(null);
     };
   }, [isLiveBackend, sat, antennaId]);
 
