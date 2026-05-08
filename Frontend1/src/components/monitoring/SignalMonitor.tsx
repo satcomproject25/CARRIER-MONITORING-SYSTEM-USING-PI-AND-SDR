@@ -134,27 +134,34 @@ export const SignalMonitor = () => {
 
       for (let i = 0; i < result.carriers.length; i++) {
         const c = result.carriers[i];
+        const carrierPower = c.peakPower - 3; // Approximate total power from peak
+        const ebNo = c.cnRatio * 0.7; // Eb/No calculation
+        const freqStart = c.centerFreq - (c.bandwidth / 2);
+        const freqStop = c.centerFreq + (c.bandwidth / 2);
+        
         newLogs.push({
           time: now,
-          message: `Carrier ${i + 1} [AUTH]  |  Freq: ${(c.centerFreq / 1e6).toFixed(3)} MHz  |  BW: ${(c.bandwidth / 1e3).toFixed(1)} kHz  |  Peak: ${c.peakPower.toFixed(1)} dB  |  C/N: ${c.cnRatio.toFixed(2)} dB`,
+          message: `Carrier ${i + 1} [AUTH]  |  Freq: ${(c.centerFreq / 1e6).toFixed(3)} MHz  |  Pwr: ${carrierPower.toFixed(1)} dB  |  BW: ${(c.bandwidth / 1e3).toFixed(1)} kHz  |  Peak: ${c.peakPower.toFixed(1)} dB  |  Noise: ${result.noiseFloor.toFixed(1)} dB  |  Range: ${(freqStart / 1e6).toFixed(3)}-${(freqStop / 1e6).toFixed(3)} MHz  |  C/N: ${c.cnRatio.toFixed(2)} dB  |  Eb/No: ${ebNo.toFixed(2)} dB`,
           color: ['#4ec9b0', '#6abf69', '#98e898', '#00ff7f', '#b2fab4'][i % 5],
           type: 'carrier',
         });
       }
 
       for (const intf of result.interferences) {
+        const intfBw = (intf.endFreq - intf.startFreq) / 1e3;
         newLogs.push({
           time: now,
-          message: `  └─ INTERFERENCE [${intf.method.toUpperCase()}]  |  Center: ${(intf.peakFreq / 1e6).toFixed(4)} MHz  |  Strength: +${intf.strengthDb.toFixed(1)} dB  |  Range: ${(intf.startFreq / 1e6).toFixed(4)}-${(intf.endFreq / 1e6).toFixed(4)} MHz`,
+          message: `  └─ INTERFERENCE [${intf.method.toUpperCase()}]  |  Center: ${(intf.peakFreq / 1e6).toFixed(4)} MHz  |  BW: ${intfBw.toFixed(1)} kHz  |  Strength: +${intf.strengthDb.toFixed(1)} dB  |  Range: ${(intf.startFreq / 1e6).toFixed(4)}-${(intf.endFreq / 1e6).toFixed(4)} MHz`,
           color: '#ff6b6b',
           type: 'interference',
         });
       }
 
       if (result.carriers.length === 0) {
+        const cnRatio = Math.max(0, result.detectThreshold - result.noiseFloor);
         newLogs.push({
           time: now,
-          message: `No carriers  |  Noise: ${result.noiseFloor.toFixed(1)} dB  |  Threshold: ${result.detectThreshold.toFixed(1)} dB`,
+          message: `No carriers detected  |  Noise: ${result.noiseFloor.toFixed(1)} dB  |  Threshold: ${result.detectThreshold.toFixed(1)} dB  |  C/N: ${cnRatio.toFixed(2)} dB  |  Center: ${(70).toFixed(1)} MHz  |  BW: ${(20).toFixed(1)} MHz`,
           color: '#808080',
           type: 'info',
         });

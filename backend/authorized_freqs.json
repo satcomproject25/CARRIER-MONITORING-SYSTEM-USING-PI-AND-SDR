@@ -31,6 +31,11 @@
       "center": 66000000.0,
       "bandwidth": 500000.0,
       "label": ""
+    },
+    {
+      "center": 65200000.0,
+      "bandwidth": 500000.0,
+      "label": ""
     }
   ]
 }
