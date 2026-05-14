@@ -48,8 +48,45 @@ HW_CENTER_FREQ = 70e6
 DISPLAY_CENTER_FREQ = 70e6
 CENTER_FREQ = 70e6
 
-ZMQ_ADDR = "tcp://127.0.0.1:5555"
-ZMQ_META_ADDR = "tcp://127.0.0.1:5556"
+# =========================
+# ZMQ TRANSPORT CONFIGURATION — DISTRIBUTED DEPLOYMENT SUPPORT
+# =========================
+# Supports LOCAL and REMOTE deployment modes for distributed SDR systems:
+#   LOCAL_MODE  → all endpoints default to localhost (single-machine deployment)
+#   REMOTE_MODE → endpoints use environment variables (distributed deployment)
+#
+# Environment variables:
+#   SCIPY_ZMQ_IQ_ADDR      → IQ stream endpoint (from GNU Radio ZMQ PUB)
+#   SCIPY_ZMQ_META_ADDR    → Metadata stream endpoint (rate/fft/cf updates)
+#   SCIPY_ZMQ_CARRIER_ADDR → Carrier hints endpoint (optional carrier list)
+#   LOCAL_MODE             → "true" forces localhost (default)
+#   REMOTE_MODE            → "true" enables distributed mode
+#
+# GNU Radio configuration:
+#   - GNU Radio ZMQ PUB Sink must BIND (not connect) to these addresses
+#   - This script CONNECTS as a ZMQ SUB client
+#   - For remote deployment: set GNU Radio to bind to 0.0.0.0:PORT or specific IP
+#
+# Example remote deployment:
+#   Raspberry Pi (GNU Radio):
+#     - Bind ZMQ PUB to tcp://0.0.0.0:5555 (IQ stream)
+#   Backend server (this script):
+#     - export SCIPY_ZMQ_IQ_ADDR="tcp://192.168.1.20:5555"
+#     - export REMOTE_MODE="true"
+# =========================
+
+LOCAL_MODE = os.environ.get("LOCAL_MODE", "true").lower() == "true"
+REMOTE_MODE = os.environ.get("REMOTE_MODE", "false").lower() == "true"
+
+# Default localhost endpoints (LOCAL_MODE or fallback)
+DEFAULT_IQ_ADDR = "tcp://127.0.0.1:5555"
+DEFAULT_META_ADDR = "tcp://127.0.0.1:5556"
+DEFAULT_CARRIER_ADDR = "tcp://127.0.0.1:5557"
+
+# Resolve endpoints: environment variables override defaults
+ZMQ_ADDR = os.environ.get("SCIPY_ZMQ_IQ_ADDR", DEFAULT_IQ_ADDR)
+ZMQ_META_ADDR = os.environ.get("SCIPY_ZMQ_META_ADDR", DEFAULT_META_ADDR)
+ZMQ_CARRIER_ADDR = os.environ.get("SCIPY_ZMQ_CARRIER_ADDR", DEFAULT_CARRIER_ADDR)
 
 SMOOTH_BW_HZ = 5 * (20e6 / 2048)
 MIN_CARRIER_BW_HZ = 5 * (20e6 / 2048)
@@ -171,28 +208,99 @@ _conf = ConfidenceEngine(fft_size=FFT_SIZE)
 _frame_counter = 0
 
 # =========================
-# ZMQ SETUP
+# ZMQ TRANSPORT LAYER — RESILIENT DISTRIBUTED DEPLOYMENT
 # =========================
+
+def log_zmq_configuration():
+    """Log active ZMQ endpoints and deployment mode for diagnostics."""
+    mode = "LOCAL" if LOCAL_MODE else "REMOTE" if REMOTE_MODE else "HYBRID"
+    print(f"[ZMQ] Deployment mode: {mode}")
+    print(f"[ZMQ] IQ stream endpoint:      {ZMQ_ADDR}")
+    print(f"[ZMQ] Metadata stream endpoint: {ZMQ_META_ADDR}")
+    print(f"[ZMQ] Carrier hints endpoint:   {ZMQ_CARRIER_ADDR}")
+    if REMOTE_MODE:
+        print("[ZMQ] Remote mode active — expecting GNU Radio on remote host")
+    else:
+        print("[ZMQ] Local mode active — expecting GNU Radio on localhost")
+
+
+def initialize_zmq_socket(socket_type, endpoint, socket_name="socket"):
+    """
+    Initialize a ZMQ socket with resilient configuration.
+    
+    Parameters
+    ----------
+    socket_type : int
+        ZMQ socket type (e.g., zmq.SUB)
+    endpoint : str
+        ZMQ endpoint address (e.g., "tcp://192.168.1.20:5555")
+    socket_name : str
+        Human-readable socket name for logging
+    
+    Returns
+    -------
+    zmq.Socket
+        Configured ZMQ socket ready for use
+    """
+    try:
+        sock = ctx.socket(socket_type)
+        sock.connect(endpoint)
+        
+        # Configure socket options for reliable streaming
+        if socket_type == zmq.SUB:
+            sock.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
+        sock.setsockopt(zmq.CONFLATE, 1)         # Keep only latest message
+        sock.setsockopt(zmq.RCVHWM, 1)           # Receive high-water mark = 1
+        sock.setsockopt(zmq.LINGER, 0)           # Don't block on close
+        sock.setsockopt(zmq.RCVTIMEO, 100)       # 100ms receive timeout
+        
+        print(f"[ZMQ] {socket_name} connected to {endpoint}")
+        return sock
+    except zmq.ZMQError as e:
+        print(f"[ZMQ ERROR] Failed to initialize {socket_name} at {endpoint}: {e}")
+        raise
+
+
+def reconnect_socket(sock, socket_type, endpoint, socket_name="socket"):
+    """
+    Reconnect a ZMQ socket after network interruption.
+    
+    Parameters
+    ----------
+    sock : zmq.Socket or None
+        Existing socket to close (if not None)
+    socket_type : int
+        ZMQ socket type
+    endpoint : str
+        ZMQ endpoint address
+    socket_name : str
+        Human-readable socket name for logging
+    
+    Returns
+    -------
+    zmq.Socket
+        Newly connected socket
+    """
+    if sock is not None:
+        try:
+            sock.close()
+        except:
+            pass
+    
+    print(f"[ZMQ] Reconnecting {socket_name} to {endpoint}...")
+    return initialize_zmq_socket(socket_type, endpoint, socket_name)
+
+
+# Initialize ZMQ context
 ctx = zmq.Context()
 
-sock = ctx.socket(zmq.SUB)
-sock.connect(ZMQ_ADDR)
-sock.setsockopt(zmq.SUBSCRIBE, b"")
-sock.setsockopt(zmq.CONFLATE, 1)
-sock.setsockopt(zmq.RCVHWM, 1)
-sock.setsockopt(zmq.LINGER, 0)
+# Log configuration at startup
+log_zmq_configuration()
 
-carrier_sock = ctx.socket(zmq.SUB)
-carrier_sock.connect("tcp://127.0.0.1:5557")
-carrier_sock.setsockopt(zmq.SUBSCRIBE, b"")
-carrier_sock.setsockopt(zmq.CONFLATE, 1)
-carrier_sock.setsockopt(zmq.RCVHWM, 1)
-
-meta_sock = ctx.socket(zmq.SUB)
-meta_sock.connect(ZMQ_META_ADDR)
-meta_sock.setsockopt(zmq.SUBSCRIBE, b"")
-meta_sock.setsockopt(zmq.CONFLATE, 1)
-meta_sock.setsockopt(zmq.RCVHWM, 1)
+# Initialize all ZMQ sockets with resilient configuration
+sock = initialize_zmq_socket(zmq.SUB, ZMQ_ADDR, "IQ stream")
+carrier_sock = initialize_zmq_socket(zmq.SUB, ZMQ_CARRIER_ADDR, "Carrier hints")
+meta_sock = initialize_zmq_socket(zmq.SUB, ZMQ_META_ADDR, "Metadata stream")
 
 # =========================
 # SHARED STATE
@@ -204,6 +312,12 @@ _latest_carriers  = None
 
 
 class DataFetcher(threading.Thread):
+    """
+    Resilient ZMQ data fetcher with automatic reconnection.
+    
+    Polls IQ, metadata, and carrier hint streams with timeout handling.
+    Automatically reconnects sockets on network interruption.
+    """
     def __init__(self):
         super().__init__(daemon=True)
         self._stop_event = threading.Event()
@@ -211,23 +325,113 @@ class DataFetcher(threading.Thread):
         self._poller.register(sock,         zmq.POLLIN)
         self._poller.register(meta_sock,    zmq.POLLIN)
         self._poller.register(carrier_sock, zmq.POLLIN)
+        self._reconnect_interval = 5.0  # seconds between reconnect attempts
+        self._last_reconnect_attempt = 0.0
 
     def stop(self):
         self._stop_event.set()
 
+    def _attempt_reconnect(self):
+        """Attempt to reconnect all ZMQ sockets after network interruption."""
+        global sock, meta_sock, carrier_sock
+        
+        now = time.time()
+        if now - self._last_reconnect_attempt < self._reconnect_interval:
+            return  # Rate-limit reconnect attempts
+        
+        self._last_reconnect_attempt = now
+        print("[ZMQ] Network interruption detected — attempting reconnect...")
+        
+        try:
+            # Unregister old sockets from poller
+            try:
+                self._poller.unregister(sock)
+                self._poller.unregister(meta_sock)
+                self._poller.unregister(carrier_sock)
+            except:
+                pass
+            
+            # Reconnect all sockets
+            sock = reconnect_socket(sock, zmq.SUB, ZMQ_ADDR, "IQ stream")
+            meta_sock = reconnect_socket(meta_sock, zmq.SUB, ZMQ_META_ADDR, "Metadata stream")
+            carrier_sock = reconnect_socket(carrier_sock, zmq.SUB, ZMQ_CARRIER_ADDR, "Carrier hints")
+            
+            # Re-register with poller
+            self._poller.register(sock,         zmq.POLLIN)
+            self._poller.register(meta_sock,    zmq.POLLIN)
+            self._poller.register(carrier_sock, zmq.POLLIN)
+            
+            print("[ZMQ] Reconnection successful")
+        except Exception as e:
+            print(f"[ZMQ ERROR] Reconnection failed: {e}")
+
     def run(self):
         global _latest_iq, _latest_meta, _latest_carriers
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
         while not self._stop_event.is_set():
-            events = dict(self._poller.poll(timeout=10))
-            if not events: continue
-            if sock in events:
-                data = sock.recv()
-                iq = np.frombuffer(data, dtype=np.complex64)
-                with _state_lock: _latest_iq = iq.copy()
-            if meta_sock in events:
-                with _state_lock: _latest_meta = meta_sock.recv_json()
-            if carrier_sock in events:
-                with _state_lock: _latest_carriers = carrier_sock.recv_json()
+            try:
+                # Poll with timeout for non-blocking operation
+                events = dict(self._poller.poll(timeout=100))  # 100ms timeout
+                
+                if not events:
+                    continue
+                
+                # Reset error counter on successful poll
+                consecutive_errors = 0
+                
+                # Process IQ stream
+                if sock in events:
+                    try:
+                        data = sock.recv(flags=zmq.NOBLOCK)
+                        iq = np.frombuffer(data, dtype=np.complex64)
+                        with _state_lock:
+                            _latest_iq = iq.copy()
+                    except zmq.Again:
+                        pass  # No data available (non-blocking)
+                    except Exception as e:
+                        print(f"[ZMQ ERROR] IQ stream receive error: {e}")
+                        consecutive_errors += 1
+                
+                # Process metadata stream
+                if meta_sock in events:
+                    try:
+                        with _state_lock:
+                            _latest_meta = meta_sock.recv_json(flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        pass
+                    except Exception as e:
+                        print(f"[ZMQ ERROR] Metadata stream receive error: {e}")
+                        consecutive_errors += 1
+                
+                # Process carrier hints stream
+                if carrier_sock in events:
+                    try:
+                        with _state_lock:
+                            _latest_carriers = carrier_sock.recv_json(flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        pass
+                    except Exception as e:
+                        print(f"[ZMQ ERROR] Carrier hints stream receive error: {e}")
+                        consecutive_errors += 1
+                
+                # Trigger reconnect if too many consecutive errors
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"[ZMQ] {consecutive_errors} consecutive errors — triggering reconnect")
+                    self._attempt_reconnect()
+                    consecutive_errors = 0
+                    
+            except zmq.ZMQError as e:
+                print(f"[ZMQ ERROR] Polling error: {e}")
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    self._attempt_reconnect()
+                    consecutive_errors = 0
+                time.sleep(0.1)  # Brief pause before retry
+            except Exception as e:
+                print(f"[ZMQ ERROR] Unexpected error in DataFetcher: {e}")
+                time.sleep(0.1)
 
 
 # =========================
@@ -2494,7 +2698,10 @@ def _run_headless_snapshot_api():
 
     import logging as _logging
     _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
-    app.run(host="127.0.0.1", port=API_PORT, debug=False,
+    # Bind to 0.0.0.0 to allow access from remote frontend (e.g., Computer 2)
+    # Use 127.0.0.1 only if you want localhost-only access
+    bind_host = os.environ.get("SCIPY_API_HOST", "0.0.0.0")
+    app.run(host=bind_host, port=API_PORT, debug=False,
             use_reloader=False, threaded=True)
 
 

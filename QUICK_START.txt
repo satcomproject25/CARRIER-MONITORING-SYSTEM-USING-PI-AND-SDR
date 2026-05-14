@@ -1,0 +1,142 @@
+╔═══════════════════════════════════════════════════════════════════════╗
+║                    SDR SYSTEM QUICK START GUIDE                       ║
+║              Campus Network — Pi + Computer 2 Setup                   ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ STEP 1: RASPBERRY PI SETUP                                            │
+└───────────────────────────────────────────────────────────────────────┘
+
+1. Find Pi's IP address:
+   $ hostname -I
+   Example: 10.10.50.20  ← WRITE THIS DOWN!
+
+2. Start GNU Radio (Terminal 1):
+   $ cd /path/to/project/backend
+   $ python3 sdr_scipy.py
+
+3. Start Backend (Terminal 2):
+   $ cd /path/to/project
+   $ export SCIPY_HEADLESS=1
+   $ python backend/Interference.py
+
+4. Verify backend is running:
+   $ curl http://localhost:8766/api/health
+   Expected: {"status":"ok","headless":true,"port":8766}
+
+✓ Raspberry Pi ready!
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ STEP 2: COMPUTER 2 SETUP                                              │
+└───────────────────────────────────────────────────────────────────────┘
+
+1. Test connection to Pi:
+   $ ping 10.10.50.20  ← Use your Pi's IP
+   $ curl http://10.10.50.20:8766/api/health
+
+2. Configure frontend:
+   $ cd /path/to/project/Frontend1
+   $ echo "VITE_API_URL=http://10.10.50.20:8766" > .env
+                         ↑↑↑↑↑↑↑↑↑↑↑↑
+                    USE YOUR PI'S IP!
+
+3. Install dependencies (first time only):
+   $ npm install
+
+4. Start frontend:
+   $ npm run dev
+
+5. Open browser:
+   http://localhost:5173
+
+✓ System operational!
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ TROUBLESHOOTING                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+
+Problem: Frontend shows "API connection failed"
+Fix:
+  1. Check Frontend1/.env has correct Pi IP
+  2. Test: curl http://10.10.50.20:8766/api/health
+  3. Check firewall on Pi: sudo ufw allow 8766/tcp
+
+Problem: "Connection refused" from Computer 2
+Fix:
+  1. Verify backend running on Pi: ps aux | grep Interference
+  2. Check binding: netstat -tuln | grep 8766
+     Should show: tcp 0.0.0.0:8766 LISTEN
+  3. Restart backend if needed
+
+Problem: No spectrum data
+Fix:
+  1. Check GNU Radio running: ps aux | grep sdr_scipy
+  2. Restart both GNU Radio and Backend
+  3. Check SDR hardware connected
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ FIREWALL (IF NEEDED)                                                  │
+└───────────────────────────────────────────────────────────────────────┘
+
+On Raspberry Pi:
+$ sudo ufw allow from 10.10.50.0/24 to any port 8766
+
+Or for specific Computer 2 IP:
+$ sudo ufw allow from 10.10.50.100 to any port 8766
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ ENVIRONMENT VARIABLES (OPTIONAL)                                      │
+└───────────────────────────────────────────────────────────────────────┘
+
+Raspberry Pi:
+  export SCIPY_HEADLESS=1              # No GUI (required for headless)
+  export SCIPY_API_HOST=0.0.0.0        # Allow network access (default)
+  export SCIPY_SNAPSHOT_PORT=8766      # API port (default)
+  export SCIPY_ACTIVE_ANTENNA=gsat-30  # Antenna config
+
+Computer 2:
+  Frontend1/.env:
+    VITE_API_URL=http://10.10.50.20:8766  # Pi's IP and port
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ SYSTEM CHECK                                                          │
+└───────────────────────────────────────────────────────────────────────┘
+
+From Computer 2:
+$ curl http://10.10.50.20:8766/api/snapshot | jq .
+
+Should return JSON with:
+  - freq_mhz: [array of frequencies]
+  - psd_db: [array of power values]
+  - carriers: [detected carriers]
+  - interference: [detected interference]
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ FULL DOCUMENTATION                                                    │
+└───────────────────────────────────────────────────────────────────────┘
+
+📘 YOUR_SETUP_SUMMARY.md          — Quick overview for your setup
+📘 CAMPUS_DEPLOYMENT_GUIDE.md     — Complete step-by-step guide
+📘 backend/DISTRIBUTED_DEPLOYMENT.md — Technical details
+📘 ZMQ_REFACTOR_SUMMARY.md        — Code changes summary
+
+┌───────────────────────────────────────────────────────────────────────┐
+│ ARCHITECTURE                                                          │
+└───────────────────────────────────────────────────────────────────────┘
+
+  Raspberry Pi (10.10.50.20)          Computer 2 (10.10.50.100)
+  ┌─────────────────────┐             ┌──────────────────┐
+  │ GNU Radio           │             │ React Frontend   │
+  │   ↓ localhost ZMQ   │             │ Browser :5173    │
+  │ Backend             │────LAN─────→│                  │
+  │ Flask API :8766     │  HTTP       │                  │
+  └─────────────────────┘             └──────────────────┘
+
+✓ No internet required
+✓ All on campus network
+✓ Simple localhost ZMQ (no config)
+✓ Frontend connects over LAN
+
+═══════════════════════════════════════════════════════════════════════
+                         READY TO START!
+═══════════════════════════════════════════════════════════════════════
