@@ -232,4 +232,4 @@ if __name__ == "__main__":
     print("  POST /api/monitor/start   — headless SDR + Interference.py")
     print("  POST /api/monitor/stop")
     print("  GET  /api/snapshot        — proxy to detector")
-    app.run(host="127.0.0.1", port=ORCHESTRATOR_PORT, threaded=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=ORCHESTRATOR_PORT, threaded=True, use_reloader=False)

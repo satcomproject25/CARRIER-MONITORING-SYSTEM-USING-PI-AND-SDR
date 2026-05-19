@@ -1,0 +1,1238 @@
+# Technical Implementation Report
+## ISTRAC SDR-Based Satellite Interference Detection System
+
+---
+
+## Table of Contents
+
+1. [System Overview](#1-system-overview)
+2. [Hardware and Signal Acquisition Layer](#2-hardware-and-signal-acquisition-layer)
+3. [ZMQ Inter-Process Transport Layer](#3-zmq-inter-process-transport-layer)
+4. [Signal Processing Pipeline](#4-signal-processing-pipeline)
+   - 4.1 IQ Sample Acquisition and Buffering
+   - 4.2 Windowed FFT and Power Spectral Density
+   - 4.3 Adaptive Noise Floor Estimation
+   - 4.4 Adaptive Carrier Detection
+   - 4.5 Morphological Filtering
+   - 4.6 Carrier Hysteresis Thresholding
+   - 4.7 Gradient-Aware Edge Walk
+5. [Interference Detection Algorithms](#5-interference-detection-algorithms)
+   - 5.1 Spectral Bump Detector
+   - 5.2 Local Variance Anomaly Detector
+   - 5.3 Curvature (Second-Derivative) Detector
+   - 5.4 Edge Interference Detector
+   - 5.5 Sub-band Variance Detector
+   - 5.6 Level-Shift Detector
+   - 5.7 Intra-Carrier Gap Detector
+   - 5.8 Valley / Carrier-Split Detector
+   - 5.9 Isolated Narrowband Spike Detector
+6. [Carrier-Under-Carrier (CuC) Detection](#6-carrier-under-carrier-cuc-detection)
+7. [Temporal Stability and Detection Tracking](#7-temporal-stability-and-detection-tracking)
+8. [Confidence Engine (detection_confidence.py)](#8-confidence-engine)
+9. [Unauthorized Carrier Detection](#9-unauthorized-carrier-detection)
+10. [Authorized Frequency Management](#10-authorized-frequency-management)
+11. [Snapshot API and Data Serialization](#11-snapshot-api-and-data-serialization)
+12. [Orchestrator and Process Management](#12-orchestrator-and-process-management)
+13. [Frontend Architecture and Data Flow](#13-frontend-architecture-and-data-flow)
+14. [End-to-End Data Flow Summary](#14-end-to-end-data-flow-summary)
+
+---
+
+## 1. System Overview
+
+This system is a real-time Software-Defined Radio (SDR) based satellite interference detection platform developed for ISTRAC (ISRO Telemetry, Tracking and Command Network). It monitors a configurable RF spectrum band, detects active carriers, classifies each carrier as authorized or unauthorized, and identifies multiple categories of intra-carrier interference — all in real time at approximately 30 frames per second.
+
+The system is composed of four loosely coupled processes:
+
+| Process | File | Port | Role |
+|---|---|---|---|
+| GNU Radio Flowgraph | `sdr_scipy.py` | ZMQ 5555/5556 | SDR hardware driver, IQ publisher |
+| Interference Detector | `Interference.py` | HTTP 8766 | Core DSP and detection engine |
+| Orchestrator | `orchestrator.py` | HTTP 8780 | Process lifecycle manager, API proxy |
+| Config Manager | `config_manager.py` | HTTP 5580 | Authorized frequency store |
+
+The React/TypeScript frontend (port 8080) communicates exclusively with the Orchestrator over HTTP, polling the `/api/snapshot` endpoint every 400 ms to retrieve the latest detection state.
+
+---
+
+## 2. Hardware and Signal Acquisition Layer
+
+**File:** `backend/sdr_scipy.py`
+
+The GNU Radio flowgraph (`sdr_scipy.py`) is the hardware abstraction layer. It interfaces with the SDR hardware (HackRF One in the reference deployment) via the SoapySDR abstraction layer using the `soapy_source_0` block.
+
+**Hardware configuration parameters:**
+
+| Parameter | Value | Description |
+|---|---|---|
+| `samp_rate` | 20 MHz | ADC sample rate (complex samples/sec) |
+| `freq` | 70 MHz | Center tuning frequency |
+| `fft_size` | 2048 | FFT size for GNU Radio display sinks |
+| Gain | 20.6 dB | RF front-end gain |
+
+**Signal chain within GNU Radio:**
+
+```
+HackRF (SoapySDR) → soapy_source_0 (complex64 IQ stream)
+                         │
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+    qtgui_freq_sink  qtgui_waterfall  zeromq_pub_sink_0
+    (local display)  (local display)  tcp://127.0.0.1:5555
+```
+
+The `zeromq_pub_sink_0` block publishes raw complex64 IQ samples over a ZMQ PUB socket bound to `tcp://127.0.0.1:5555`. This is the primary data feed for the detection pipeline. The GNU Radio block also exposes an XML-RPC server on port 8080 for runtime parameter control (center frequency, sample rate).
+
+The IQ samples are in **complex64 format** (32-bit float real + 32-bit float imaginary), representing the baseband in-phase and quadrature components of the received RF signal after down-conversion and digitization.
+
+---
+
+## 3. ZMQ Inter-Process Transport Layer
+
+**File:** `backend/Interference.py` — `DataFetcher` class
+
+ZeroMQ (ZMQ) is used as the inter-process communication backbone between GNU Radio and the detection engine. Three independent ZMQ SUB sockets are maintained:
+
+| Socket | Endpoint | Data Type | Content |
+|---|---|---|---|
+| `sock` | `tcp://127.0.0.1:5555` | `complex64` binary | Raw IQ samples |
+| `meta_sock` | `tcp://127.0.0.1:5556` | JSON | Sample rate, FFT size, center frequency |
+| `carrier_sock` | `tcp://127.0.0.1:5557` | JSON | Optional carrier hint list |
+
+All three sockets are configured with `CONFLATE=1` and `RCVHWM=1`, meaning only the **most recent message** is retained in the socket buffer. This is a deliberate design choice: the detection pipeline always processes the freshest available data, discarding stale frames rather than accumulating a backlog. This ensures real-time responsiveness at the cost of never processing every single frame.
+
+**`DataFetcher` thread operation:**
+
+The `DataFetcher` class runs as a daemon thread. It uses a `zmq.Poller` to multiplex all three sockets with a 100 ms timeout. On each poll cycle:
+
+1. If IQ data is available on `sock`: deserialize `np.frombuffer(data, dtype=np.complex64)` and store under `_state_lock`.
+2. If metadata is available on `meta_sock`: parse JSON and store.
+3. If carrier hints are available on `carrier_sock`: parse JSON and store.
+
+**Resilient reconnection:** If `consecutive_errors >= 10`, the thread calls `_attempt_reconnect()`, which closes all three sockets, re-creates them, and re-registers them with the poller. Reconnect attempts are rate-limited to one every 5 seconds to prevent thrashing.
+
+**Distributed deployment:** For LAN deployment (Raspberry Pi running GNU Radio, separate machine running the detector), the ZMQ endpoints are overridden via environment variables:
+
+```
+SCIPY_ZMQ_IQ_ADDR=tcp://192.168.x.x:5555
+SCIPY_ZMQ_META_ADDR=tcp://192.168.x.x:5556
+REMOTE_MODE=true
+```
+
+The GNU Radio flowgraph must bind its ZMQ PUB sink to `tcp://0.0.0.0:5555` (all interfaces) for this to work.
+
+---
+
+## 4. Signal Processing Pipeline
+
+**File:** `backend/Interference.py` — `update()` function
+
+The `update()` function is the main processing loop. In headless mode it is called every 33 ms (≈30 fps) from a `time.sleep(0.033)` loop. In desktop mode it is driven by a `QtCore.QTimer` at 33 ms intervals.
+
+### 4.1 IQ Sample Acquisition and Buffering
+
+At the start of each `update()` call, the latest IQ frame and metadata are atomically retrieved under `_state_lock` and the shared state is cleared (so the next call gets fresh data, not a repeat).
+
+If a metadata update is present, all pipeline state is reset: window function, IQ buffer, max/min hold arrays, persistence dictionaries, and all `DetectionTracker` instances. This ensures the pipeline is consistent after a tuning change.
+
+The IQ buffer is filled:
+
+```python
+iq_buffer[:] = iq[:FFT_SIZE]   # take exactly FFT_SIZE = 2048 samples
+```
+
+### 4.2 Windowed FFT and Power Spectral Density
+
+**Input:** `iq_buffer` — complex64 array of length `FFT_SIZE = 2048`
+
+**Window function:** Hann window, computed by `scipy.signal.get_window("hann", FFT_SIZE)`.
+
+The Hann window is applied to reduce spectral leakage — without windowing, the sharp discontinuity at the buffer boundaries would create sidelobes that could mask adjacent carriers or create false detections.
+
+**FFT and PSD computation:**
+
+```python
+spectrum = np.fft.fftshift(np.fft.fft(iq_buffer * window))
+psd      = 20 * np.log10(np.abs(spectrum) + 1e-12)
+```
+
+The `fftshift` reorders the FFT output so that DC (0 Hz) is at the center of the array, with negative frequencies on the left and positive frequencies on the right — matching the physical spectrum display convention.
+
+The magnitude is converted to decibels:
+
+```
+PSD[k] = 20 · log₁₀(|FFT[k]| + ε)   [dB]
+```
+
+where `ε = 1e-12` prevents `log(0)` for bins with zero power.
+
+**Frequency axis:**
+
+```python
+df = HW_SAMPLE_RATE / FFT_SIZE   # bin spacing = 20e6 / 2048 ≈ 9765.6 Hz/bin
+freq_axis = np.arange(-FFT_SIZE//2, FFT_SIZE//2) * df + HW_CENTER_FREQ
+```
+
+Each bin `k` maps to frequency `f_k = HW_CENTER_FREQ + (k - FFT_SIZE/2) · df`.
+
+**Output:** `psd` — float64 array of length 2048, values in dB, indexed by frequency bin.
+
+---
+
+### 4.3 Adaptive Noise Floor Estimation
+
+**Function:** `estimate_noise_floor_adaptive(psd, percentile=NF_PERCENTILE)`
+
+**Input:** `psd_s` — smoothed PSD array (dB), `percentile = 15.0`
+
+**Problem with static median:** A simple `np.median(psd)` is biased upward when wide carriers occupy a large fraction of the spectrum. The rolling-percentile approach solves this.
+
+**Algorithm:**
+
+1. Define window size: `window = max(32, FFT_SIZE // NF_ROLLING_WINDOW_DIV)` where `NF_ROLLING_WINDOW_DIV = 8`, giving `window = 256 bins`.
+2. Slide the window across the PSD with step `= window // 4 = 64 bins`.
+3. In each window, compute the 15th percentile: `np.percentile(psd[i:i+window], 15.0)`.
+4. Return the **median of all window floors**.
+
+```
+noise_floor = median({ P₁₅(psd[i : i+256]) : i = 0, 64, 128, ... })
+```
+
+The 15th percentile within each window captures the noise floor even when a carrier occupies up to 85% of that window. Taking the median across all windows makes the estimate robust to multiple adjacent carriers.
+
+**Output:** `noise` — scalar float (dB), the estimated global noise floor.
+
+**Adaptive detection threshold:**
+
+```python
+_nf_mask         = psd_s < (noise + 10.0)          # bins plausibly in noise
+noise_sigma      = np.std(psd_s[_nf_mask])          # σ of noise-only bins
+detect_threshold = noise + max(2.5, CARRIER_K_SIGMA * noise_sigma)
+```
+
+where `CARRIER_K_SIGMA = 3.5`. This is a **noise + k·σ** threshold — a standard statistical detection criterion. A bin is considered to contain a carrier signal if its power exceeds the noise floor by more than 3.5 standard deviations of the noise distribution. The `max(2.5, ...)` floor prevents the threshold from collapsing to zero in very quiet environments.
+
+---
+
+### 4.4 Adaptive Carrier Detection
+
+**Input:** `psd_s` — box-smoothed PSD (smoothed with `smooth_taps = max(3, round(SMOOTH_BW_HZ/df)) | 1` taps), `detect_threshold` from §4.3.
+
+A binary mask is formed:
+
+```python
+above = psd_s > detect_threshold
+```
+
+Connected regions of `True` bins in `above` represent candidate carrier spans. The edges of these regions are found using `np.diff(above.astype(np.int8))`, yielding rise and fall indices.
+
+---
+
+### 4.5 Morphological Filtering
+
+Raw binary masks from threshold detection contain isolated single-bin spikes (false positives from noise) and small gaps within real carriers (false negatives from spectral ripple). Two morphological operations correct these:
+
+**Morphological Opening** (spike removal, `MORPH_OPEN_BINS = 3`):
+
+Opening = Erosion followed by Dilation. A bin survives erosion only if all bins within a ±1 bin kernel are also `True`. This removes isolated 1–2 bin spikes. The subsequent dilation restores the boundaries of surviving (genuine) carrier regions.
+
+```
+Erosion:  eroded[i] = AND(above[i-1], above[i], above[i+1])
+Dilation: dilated[i] = OR(eroded[i-1], eroded[i], eroded[i+1])
+```
+
+**Morphological Closing** (gap bridging, `MORPH_CLOSE_BINS = 5`):
+
+Closing = Dilation followed by Erosion. This bridges small gaps (≤2 bins) within a carrier caused by spectral notches or ripple, preventing a single carrier from being fragmented into multiple spans.
+
+---
+
+### 4.6 Carrier Hysteresis Thresholding
+
+**Parameter:** `CARRIER_HIGH_THRESH_OFFSET = 4.0 dB`
+
+After morphological filtering, each connected region in `above` is validated: it must contain at least one bin above a stricter "high threshold":
+
+```python
+_high_thr = detect_threshold + 4.0   # dB
+```
+
+Regions that never reach this high threshold are removed from `above`. This eliminates flat noise bumps that happen to exceed the detection threshold but lack a genuine spectral peak — a common source of false carrier detections in environments with elevated noise floors.
+
+---
+
+### 4.7 Gradient-Aware Edge Walk
+
+**Function:** `_edge_walk(r_bin, f_bin)`
+
+After carrier spans are identified by their bin indices `(r, f)`, the precise frequency boundaries in Hz are determined by walking outward from the span edges to the noise floor, using gradient information to snap to spectral edges.
+
+**Left edge walk:**
+```
+le = r_bin
+while psd_s[le] > noise + 1.5:
+    if gradient flips from negative to positive → local minimum → stop (valley snap)
+    if |gradient[le]| < 0.55 dB/bin AND psd_s[le] < noise + 4.0 → stop (flat region)
+    le -= 1
+```
+
+**Right edge walk:** symmetric, stopping when gradient flips from negative to positive or enters a flat near-noise region.
+
+The gradient is pre-computed once per frame as `_psd_s_grad = np.gradient(psd_s)` and reused for all carriers. The valley-snap condition prevents the edge walk from crossing into an adjacent carrier's slope.
+
+**Output:** `(f_start_hz, f_stop_hz)` — the precise frequency boundaries of the carrier highlight.
+
+---
+
+## 5. Interference Detection Algorithms
+
+**Function:** `detect_interference_in_carrier(psd_segment, freq_segment)`
+
+**Input:**
+- `psd_segment` — 1D float array, PSD values (dB) for bins within one carrier span
+- `freq_segment` — 1D float array, corresponding frequency values (Hz)
+
+**Output:** List of hit dictionaries, each containing:
+```json
+{
+  "start_freq": float,    // Hz — left edge of interference region
+  "end_freq":   float,    // Hz — right edge
+  "peak_freq":  float,    // Hz — peak power location
+  "strength_db": float,   // dB — excess power above local reference
+  "method":     string,   // detection method name
+  "is_gap":     bool      // true for gap-type detections
+}
+```
+
+This function is called once per detected carrier span per frame. It runs six independent sub-detectors in sequence, collects all hits, then merges overlapping hits within `INTF_MERGE_GAP_HZ = 200 kHz`.
+
+**Adaptive local statistics (computed once, shared by all sub-detectors):**
+
+```python
+_local_floor = np.percentile(psd_segment, 15.0)
+_local_sigma = np.std(psd_segment[psd_segment < (_local_floor + 8.0)])
+_local_sigma = max(_local_sigma, 0.5)
+_bump_thr    = min(max(INTF_BUMP_THRESHOLD_DB, 1.5 * _local_sigma), 6.0)
+```
+
+The bump threshold adapts to the carrier's own noise statistics: it is at least `INTF_BUMP_THRESHOLD_DB = 3 dB` but scales up with local σ to avoid false alarms in noisy carriers, and is capped at 6 dB to remain sensitive to real interference in high-power carriers.
+
+---
+
+### 5.1 Spectral Bump Detector
+
+**Method tag:** `'bump'`
+
+**Principle:** A clean carrier has a smooth, slowly varying PSD shape (RRC roll-off, flat top). An interfering signal superimposed on the carrier creates a localized power excess — a "bump" — above the carrier's expected envelope.
+
+**Algorithm:**
+
+1. Compute a rolling median envelope of the carrier PSD using a sliding window of half-width `half = min(INTF_ENVELOPE_ORDER, n//2)` where `INTF_ENVELOPE_ORDER = 9`:
+
+```python
+pad      = np.pad(psd_segment, half, mode='edge')
+envelope = [np.median(pad[i : i + 2*half + 1]) for i in range(n)]
+```
+
+2. Compute the residual:
+```
+residual[i] = psd_segment[i] - envelope[i]
+```
+
+3. Apply the adaptive bump threshold:
+```
+bump_mask[i] = residual[i] > _bump_thr
+```
+
+4. Find connected regions in `bump_mask` using `np.diff`. Each region with width ≥ `INTF_MIN_BUMP_BINS = 1.0` bins is reported as a hit with `strength_db = residual[peak_bin]`.
+
+**Physical interpretation:** The rolling median models the "expected" carrier shape. Any bin where the actual PSD exceeds this model by more than `_bump_thr` dB is flagged as anomalous. This detects narrowband CW interferers, partial carrier overlaps, and spectral regrowth from nonlinear amplification.
+
+---
+
+### 5.2 Local Variance Anomaly Detector
+
+**Method tag:** `'variance'`
+
+**Principle:** A clean carrier has relatively uniform power distribution across its bandwidth. An interfering signal creates a region of elevated local variance — the PSD fluctuates more rapidly where two signals overlap.
+
+**Algorithm:**
+
+1. Compute local variance in a sliding window of width `w = min(INTF_VARIANCE_WINDOW, n//3)` where `INTF_VARIANCE_WINDOW = 7`:
+
+```python
+local_var[i] = np.var(psd_segment[max(0, i-w) : i+w+1])
+```
+
+2. Compute the median variance across the carrier:
+```
+med_var = median(local_var) + ε
+```
+
+3. Flag bins where local variance exceeds the adaptive threshold:
+```
+anom_mask[i] = local_var[i] > _var_sigma × med_var
+```
+where `_var_sigma = max(INTF_VARIANCE_SIGMA, 1.5) = 2.5`.
+
+4. Connected anomalous regions with `strength_db = psd_segment[peak] - median(psd_segment) > max(2.0, _local_sigma)` are reported.
+
+**Physical interpretation:** This detector is complementary to the bump detector. It catches interference that creates spectral roughness without a clear amplitude peak — for example, a spread-spectrum interferer or a partially overlapping carrier whose power is comparable to the host carrier.
+
+---
+
+### 5.3 Curvature (Second-Derivative) Detector
+
+**Method tag:** `'curvature'`
+
+**Principle:** A hidden carrier buried under a dominant carrier creates inflection points in the composite PSD — locations where the second derivative of the spectrum changes sign abruptly. These curvature anomalies are invisible to amplitude-based detectors but detectable in the second derivative.
+
+**Algorithm:**
+
+1. Smooth the carrier segment with a box filter of width `kern = max(3, min(7, n//5)) | 1` (forced odd):
+```python
+sm = np.convolve(psd_segment, np.ones(kern)/kern, mode='same')
+```
+
+2. Compute the second discrete derivative:
+```python
+d2 = np.diff(sm, n=2)
+d2_padded = np.concatenate(([0], d2, [0]))   # restore length to n
+```
+
+3. Normalize against the median absolute second derivative:
+```
+med_d2 = median(|d2_padded|) + ε
+```
+
+4. Flag bins where the normalized curvature exceeds the threshold:
+```
+curv_mask[i] = d2_padded[i] > INTF_CUC_CURV_SIGMA × med_d2
+```
+where `INTF_CUC_CURV_SIGMA = 3.5`.
+
+5. Connected regions with `strength_db > max(2.5, _local_sigma)` are reported.
+
+**Physical interpretation:** The second derivative is large at the edges of a buried carrier's spectral footprint — where the composite PSD transitions from "host carrier only" to "host + hidden carrier". The MAD normalization makes the threshold adaptive to the carrier's own spectral roughness.
+
+---
+
+### 5.4 Edge Interference Detector
+
+**Method tags:** `'left_edge'`, `'right_edge'`
+
+**Principle:** Partial carrier overlap — where an interfering carrier partially overlaps the edge of the host carrier — creates elevated power in the left or right 20% of the carrier span that is not explained by the carrier's own roll-off shape.
+
+**Algorithm:**
+
+For each of the left and right 20% sub-bands (`_edge_frac = max(1, n//5)` bins):
+
+1. Extract the sub-band PSD and its corresponding rolling median envelope (reused from the bump detector).
+2. Compute the residual: `_res_edge = _seg_edge - _env_edge`.
+3. If `max(_res_edge) > _bump_thr` and the sub-band has at least `INTF_MIN_BUMP_BINS` bins, report a hit.
+
+**Physical interpretation:** This explicitly targets the scenario where an adjacent-channel carrier bleeds into the edge of the monitored carrier. The bump detector can miss this because the rolling median adapts to the elevated edge, absorbing the interference into the "expected" envelope.
+
+---
+
+### 5.5 Sub-band Variance Detector
+
+**Method tag:** `'subband_var'`
+
+**Principle:** A partial carrier overlay (where an interfering carrier covers only a portion of the host carrier's bandwidth) creates a localized increase in spectral variance in the affected sub-band, even if the absolute power level is not dramatically elevated.
+
+**Algorithm:**
+
+1. Divide the carrier into 4 equal sub-bands of width `_sb = max(4, n//4)` bins.
+2. Compute the variance of each sub-band: `_sub_vars[i] = np.var(psd_segment[i*_sb : (i+1)*_sb])`.
+3. Compute the median sub-band variance: `_med_sv = median(_sub_vars) + ε`.
+4. Flag any sub-band where `_sub_vars[i] > _var_sigma × _med_sv` and `strength_db > max(1.5, _local_sigma)`.
+
+**Physical interpretation:** This is a coarser version of the local variance detector, operating at the sub-band level rather than per-bin. It is particularly effective for detecting partial overlaps that span 25–50% of the carrier bandwidth.
+
+---
+
+### 5.6 Level-Shift Detector
+
+**Method tag:** `'level_shift'`
+
+**Principle:** When a co-channel interferer sits at the same center frequency as the host carrier, the composite PSD has a flat elevated plateau in the interior of the carrier. This plateau has:
+- Zero residual vs. rolling median (bump detector is blind)
+- Near-zero local variance (variance detector is blind)
+- Zero curvature (curvature detector is blind)
+
+The level-shift detector specifically targets this scenario.
+
+**Algorithm:**
+
+1. Compute the edge baseline: mean power of the first and last `_edge_n = max(2, n × 12%)` bins of the carrier. These edge bins represent the uncontaminated base carrier level.
+
+```python
+_edge_bins  = np.concatenate([psd_segment[:_edge_n], psd_segment[-_edge_n:]])
+_edge_level = np.mean(_edge_bins)
+```
+
+2. Compute per-bin deviation from the edge baseline:
+```
+_deviation[i] = psd_segment[i] - _edge_level
+```
+
+3. Validate that a genuine bump exists (not just natural carrier roll-off):
+```python
+_poly_co    = np.polyfit(np.linspace(-1,1,n), psd_segment, 2)
+_poly_fit   = np.polyval(_poly_co, np.linspace(-1,1,n))
+_max_bump_db = max(psd_segment - _poly_fit)
+_has_bump    = _max_bump_db >= INTF_LEVEL_SHIFT_DB   # 3.5 dB
+```
+
+4. Apply adaptive threshold: `_ls_thr = max(INTF_LEVEL_SHIFT_DB, 1.2 × _local_sigma)`.
+
+5. Find connected elevated regions: `_elevated[i] = _deviation[i] > _ls_thr`.
+
+6. For each elevated region, validate step sharpness using the adaptive gradient threshold:
+```python
+_carrier_grad_p75 = np.percentile(|gradient(psd_segment)|, 75)
+_adaptive_step_thr = max(INTF_LEVEL_SHIFT_STEP_DB, INTF_LEVEL_SHIFT_STEP_K × _carrier_grad_p75)
+```
+The boundary gradient must exceed `_adaptive_step_thr` (default `INTF_LEVEL_SHIFT_STEP_K = 3.5`). This ensures that the detected "step" is a genuine outlier relative to the carrier's own natural gradient range, not just the normal roll-off slope.
+
+7. Regions passing all guards with `strength_db > max(2.0, _ls_thr)` are reported.
+
+---
+
+### 5.7 Intra-Carrier Gap Detector
+
+**Method tag:** `'gap'`, `is_gap = True`
+
+**Principle:** Two carriers occupying adjacent but non-overlapping frequencies, when detected as a single merged span, exhibit a spectral valley (gap) between them. This gap indicates the presence of two distinct signals within what appears to be one carrier.
+
+**Algorithm:**
+
+1. Find peaks within the carrier segment using `scipy.signal.find_peaks` with `prominence=2.0` and `distance = max(3, n//10)`.
+2. For each pair of adjacent peaks `(p1, p2)`:
+   - Find the valley floor: `vi = argmin(psd_segment[p1:p2+1])`, `vp = psd_segment[vi]`.
+   - Compute depth: `depth = min(psd_segment[p1], psd_segment[p2]) - vp`.
+   - Reject if valley touches noise floor: `vp <= median(psd_segment)`.
+   - Find the valley width using a threshold at `vthr = vp + depth × 0.5`.
+3. Report if `depth > GAP_DEPTH_DB = 2.5 dB` and `valley_width >= GAP_MIN_BINS = 3`.
+
+**Output:** Hit with `is_gap=True`, `strength_db = depth`.
+
+---
+
+### 5.8 Valley / Carrier-Split Detector
+
+**Function:** `detect_carrier_valleys(psd_segment, freq_segment, noise_floor)`
+
+**Input:**
+- `psd_segment` — PSD values (dB) for one carrier span
+- `freq_segment` — corresponding frequencies (Hz)
+- `noise_floor` — global noise floor estimate (dB)
+
+**Output:** List of valley dictionaries with indices relative to segment start.
+
+**Principle:** When two carriers are closely spaced in frequency, the carrier detection pipeline may merge them into a single span. The valley detector identifies V-shaped or U-shaped spectral dips within a span that indicate the boundary between two sub-carriers.
+
+**Algorithm:**
+
+1. **Adaptive prominence:** Scale the peak-detection prominence with the carrier's dynamic range:
+```python
+_dyn_range        = max(1.0, max(psd_segment) - percentile(psd_segment, 15))
+_valley_prominence = max(1.0, min(1.5, _dyn_range × 0.12))
+```
+This prevents shallow valleys in low-SNR carriers from being missed while avoiding spurious splits in high-SNR carriers.
+
+2. **Peak detection:** `find_peaks(psd_segment, distance=max(3, n//10), prominence=_valley_prominence)`.
+
+3. **For each adjacent peak pair `(p1, p2)`:**
+   - Find valley floor `vi` and power `vp`.
+   - **Case 4 rejection:** Skip if `vp <= noise_floor + 1.5` (valley reaches noise floor → already two separate carriers).
+   - **Case 5 rejection (L-shape):** Both sides must rise ≥ `VALLEY_DEPTH_DB = 3.0 dB` above the valley.
+   - Compute depth: `depth = min(psd_segment[p1], psd_segment[p2]) - vp`.
+
+4. **Brown boundary computation:** The valley's lateral extent is defined by a threshold at `brown_threshold = vp + depth × 0.45`. Scanning inward from each peak, the first bin below this threshold defines the valley boundary. This gives a physically meaningful "width" of the spectral dip.
+
+5. **Minimum width check:** `gap_hz = |freq_segment[brown_right] - freq_segment[brown_left]| >= VALLEY_MIN_WIDTH_HZ = 10 kHz`.
+
+**Post-processing:** When valleys are detected, the parent carrier span is split at the valley boundaries into sub-carrier spans. Each sub-carrier is then independently processed for authorization and interference detection.
+
+---
+
+### 5.9 Isolated Narrowband Spike Detector
+
+**Function:** `detect_isolated_spikes(psd_smoothed, freq_ax, noise_floor, existing_spans)`
+
+**Input:**
+- `psd_smoothed` — smoothed PSD (dB)
+- `noise_floor` — estimated noise floor (dB)
+- `existing_spans` — list of `(r, f)` bin tuples already detected as carriers
+
+**Output:** Additional `(r, f)` tuples for narrow spikes not captured by the main pipeline.
+
+**Principle:** The morphological opening step (§4.5) erodes spikes narrower than `MORPH_OPEN_BINS = 3` bins. These are genuine narrowband signals (e.g., CW jammers, beacon tones) that are too narrow to survive the opening but are real signals above the noise floor.
+
+**Algorithm:**
+
+1. Build a `covered` boolean mask marking all bins already inside detected carrier spans.
+2. Find peaks using `find_peaks(psd_smoothed, height=noise_floor + SPIKE_MIN_SNR_DB, prominence=SPIKE_MIN_PROMINENCE, distance=2)` where `SPIKE_MIN_SNR_DB = 10.0 dB` and `SPIKE_MIN_PROMINENCE = 7.0 dB`.
+3. For each peak not already covered:
+   - Walk left until `psd_smoothed[le] <= noise_floor + SPIKE_WALK_STOP_DB = 3.5 dB`.
+   - Walk right symmetrically.
+   - Add `(le, re)` to spike spans if no overlap with existing carriers.
+
+---
+
+## 6. Carrier-Under-Carrier (CuC) Detection
+
+**File:** `backend/cuc_detector.py`
+**Function:** `detect_cuc_in_carrier(psd_segment, freq_segment, noise_floor)`
+
+**Input:**
+- `psd_segment` — PSD values (dB) for one carrier span (minimum 16 bins)
+- `freq_segment` — corresponding frequencies (Hz)
+- `noise_floor` — global noise floor (dB)
+
+**Output:** List of CuC hit dictionaries (empty if confidence < threshold).
+
+**Principle:** Carrier-Under-Carrier (CuC) interference occurs when a hidden secondary carrier is transmitted within the same frequency band as a dominant primary carrier. The primary carrier's power masks the secondary, making it invisible to amplitude-based detectors. The CuC detector uses Successive Interference Cancellation (SIC) in the spectral domain to reveal the hidden carrier.
+
+The detection pipeline has four stages:
+
+---
+
+### Stage 1: Primary Carrier Template Construction
+
+**Function:** `_cuc_build_template(seg_psd)`
+
+**Input:** `seg_psd` — PSD segment of the primary carrier (dB)
+
+**Algorithm:**
+
+1. Apply a wide median filter to estimate the primary carrier's spectral envelope, suppressing narrow bumps from the hidden carrier:
+```python
+template = medfilt(seg_psd, kernel_size=CUC_TEMPLATE_MEDIAN_BINS)  # 31 bins
+```
+
+2. Apply a Savitzky-Golay smoother to model the expected RRC roll-off shape:
+```python
+smoothed = savgol_filter(template, window_length=CUC_SAVGOL_WINDOW,  # 11
+                         polyorder=CUC_SAVGOL_POLY)                   # 3
+```
+
+3. Take the element-wise maximum to get a tight upper envelope:
+```
+template_final[i] = max(template[i], smoothed[i])
+```
+
+**Output:** `template` — estimated primary carrier spectral shape (dB).
+
+---
+
+### Stage 2: Spectral Subtraction (SIC Residual)
+
+**Function:** `_cuc_spectral_subtract(seg_psd, template)`
+
+**Algorithm:** Subtraction is performed in the **linear power domain** to avoid the logarithmic compression that would underestimate the residual:
+
+```
+P_measured[i] = 10^(seg_psd[i] / 10)
+P_host[i]     = 10^(template[i] / 10)
+P_residual[i] = max(P_measured[i] - P_host[i], 10^(-120/10))
+residual[i]   = 10 · log₁₀(P_residual[i])
+```
+
+The floor of −120 dB prevents `log(0)` artefacts in bins where the template perfectly matches the measured PSD.
+
+**Output:** `residual` — the SIC residual spectrum (dB). If a hidden carrier is present, it appears as elevated power in the residual. If only noise is present, the residual is flat near the noise floor.
+
+---
+
+### Stage 3a: Bump Detection on Residual
+
+The Savitzky-Golay smoothed residual is searched for peaks using `scipy.signal.find_peaks`:
+
+```python
+bump_thr   = max(CUC_BUMP_THRESHOLD_DB, 1.5 × res_sigma)   # adaptive
+detect_lvl = nf_res + bump_thr
+
+peaks, _ = find_peaks(smoothed_res,
+    height     = detect_lvl,
+    distance   = max(CUC_BUMP_MIN_BINS, 8),   # 4 bins minimum separation
+    prominence = max(1.0, 0.5 × bump_thr),
+    width      = CUC_BUMP_MIN_BINS)            # 4 bins minimum width
+```
+
+The bump score is computed as:
+```
+max_excess = max(smoothed_res[peaks]) - detect_lvl
+score_bump = 1 - exp(-max_excess / 6.0)
+```
+
+This maps excess power to a score in [0, 1] using an exponential saturation function. A 6 dB excess gives `score_bump ≈ 0.63`; a 12 dB excess gives `score_bump ≈ 0.86`.
+
+---
+
+### Stage 3b: Higher-Order Statistics — Local Kurtosis
+
+**Function:** `_cuc_local_kurtosis(residual)`
+
+**Principle:** Gaussian noise has excess kurtosis = 0. A digital modulation signal (PSK, QAM) has non-Gaussian amplitude statistics with excess kurtosis > 0. Computing kurtosis on the SIC residual reveals the statistical signature of a hidden digital carrier.
+
+**Algorithm:** Sliding window of width `CUC_HOS_WINDOW = 32` bins, step = 16 bins:
+
+```
+κ_excess[window] = E[x⁴] / (E[x²])² - 3
+```
+
+where `x` is the residual PSD in the window. The result is smoothed with a uniform filter of width 16 bins.
+
+**Score computation:**
+```python
+frac_kurt = sum(kurt_arr > CUC_HOS_THRESHOLD) / n   # fraction of high-kurtosis bins
+max_kurt  = max(kurt_arr)
+score_hos = clip(frac_kurt × (1 - exp(-max_kurt / (2 × CUC_HOS_THRESHOLD))), 0, 1)
+```
+
+where `CUC_HOS_THRESHOLD = 1.5`.
+
+---
+
+### Stage 3c: Second-Derivative Curvature on Residual
+
+The same curvature analysis as §5.3 is applied to the SIC residual:
+
+```python
+kern    = max(3, min(7, n//5)) | 1
+sm2     = np.convolve(residual, np.ones(kern)/kern, mode='same')
+d2      = np.diff(sm2, n=2)
+d2p     = np.concatenate(([0], d2, [0]))
+med_d2  = median(|d2p|) + ε
+norm_d2 = |d2p| / med_d2
+frac_cv = sum(norm_d2 > CUC_CURV_SIGMA) / n
+```
+
+where `CUC_CURV_SIGMA = 3.5`.
+
+```
+score_cv = clip(frac_cv × (1 - exp(-mean_excess / (2 × CUC_CURV_SIGMA))), 0, 1)
+```
+
+---
+
+### Stage 4: Multi-Evidence Confidence Fusion
+
+The three independent evidence scores are combined into a single confidence value using a weighted linear combination:
+
+```
+confidence = 0.40 × score_bump + 0.30 × score_hos + 0.30 × score_cv
+```
+
+The weights reflect the relative reliability of each evidence source: the bump detector (spectral regrowth) is the most direct evidence of a hidden carrier, while HOS and curvature provide corroborating evidence. The confidence is clipped to [0, 1].
+
+**Decision threshold:** `CUC_CONFIDENCE_THRESHOLD = 0.40`. Only detections with `confidence >= 0.40` are reported.
+
+**Hidden carrier localization:** If peaks were found in Stage 3a, the hidden carrier's frequency extent is determined by growing outward from each peak until the residual falls below `nf_res + 0.5 × CUC_BUMP_THRESHOLD_DB`. The center frequency, bandwidth, and peak frequency of the hidden carrier are extracted from this region.
+
+**Output fields:**
+```json
+{
+  "start_freq":   float,   // Hz
+  "end_freq":     float,   // Hz
+  "peak_freq":    float,   // Hz
+  "center_freq":  float,   // Hz
+  "strength_db":  float,   // dB above residual noise floor
+  "confidence":   float,   // [0, 1]
+  "hidden_bw_hz": float,   // estimated hidden carrier bandwidth
+  "score_bump":   float,
+  "score_hos":    float,
+  "score_curv":   float,
+  "method":       "cuc"
+}
+```
+
+---
+
+## 7. Temporal Stability and Detection Tracking
+
+**Class:** `DetectionTracker` (in `Interference.py`)
+
+**Problem:** Single-frame detections are noisy. A genuine interference event may appear and disappear across frames due to spectral fluctuations, while a false alarm may fire for one or two frames. Reporting every single-frame detection would produce an unusable flood of alerts.
+
+**Solution:** The `DetectionTracker` implements a frequency-bucketed temporal filter with debounce, hysteresis, and confidence scoring.
+
+**Frequency bucketing:** Each detection is mapped to a bucket key:
+```python
+bucket_key = round(center_freq_hz / STABILITY_BUCKET_HZ)
+```
+where `STABILITY_BUCKET_HZ = 50 kHz`. Detections within 50 kHz of each other are treated as the same event across frames.
+
+**Per-frame update logic:**
+
+For each incoming detection:
+- If a track exists for its bucket: increment `consecutive`, reset `absent_count`, update `center_freq` and `strength_db`, append to `strength_hist`.
+- If no track exists: create a new track with `consecutive = 1`.
+
+**Debounce (ON threshold):** A detection is only reported (confirmed) when:
+```
+consecutive >= STABILITY_DEBOUNCE_ON = 3   AND   confidence >= STABILITY_CONFIDENCE_MIN = 0.6
+```
+
+**Confidence computation:**
+```python
+pers = min(1.0, consecutive / debounce_on)          # persistence ratio
+cv   = std(strength_hist) / max(|mean(strength_hist)|, 0.01)   # coefficient of variation
+stab = max(0.0, 1.0 - cv)                           # strength stability
+confidence = 0.65 × pers + 0.35 × stab
+```
+
+The confidence is a weighted combination of:
+- **Persistence ratio** (65% weight): how long the detection has been continuously present, normalized to the debounce window.
+- **Strength stability** (35% weight): how consistent the detection's power level is across recent frames. A stable interference event has consistent strength; a noise fluctuation has high variance.
+
+**Hysteresis (OFF threshold):** Once confirmed, a track is only removed after being absent for `STABILITY_DEBOUNCE_OFF = 5` consecutive frames. This prevents rapid on/off flickering at the detection boundary.
+
+**Separate tracker instances:**
+
+| Tracker | `debounce_on` | `debounce_off` | Notes |
+|---|---|---|---|
+| `_intf_tracker` | 3 | 5 | Intra-carrier interference |
+| `_gap_tracker` | 3 | 5 | Gap detections |
+| `_valley_tracker` | 4 | 5 | Valleys (need more stability) |
+| `_carrier_tracker` | 2 | 8 | Carrier presence (fast on, slow off) |
+| `_cuc_tracker` | 3 | 6 | CuC detections |
+
+---
+
+## 8. Confidence Engine
+
+**File:** `backend/detection_confidence.py` — `ConfidenceEngine` class
+
+The `ConfidenceEngine` is an augmentation layer that wraps the output of `detect_interference_in_carrier()` and adds four orthogonal enhancements without modifying the core detection logic.
+
+**Entry point:** `engine.augment(psd_raw, display_psd, carrier_span, carrier_cf, intf_hits, noise_floor, frame_idx, freq_axis)`
+
+---
+
+### Module A: Temporal Covariance Confidence (MME / Marchenko-Pastur)
+
+**Principle:** Under the null hypothesis (noise only), the eigenvalue distribution of the sample covariance matrix of a K×w PSD matrix follows the Marchenko-Pastur law. Under the alternative hypothesis (structured signal present), the largest eigenvalue is pushed above the MP upper edge. The ratio λ_max/λ_min is a sensitive test statistic.
+
+**Algorithm:**
+
+1. Maintain a ring buffer of the last `COV_FRAME_DEPTH = 6` raw PSD frames.
+2. For each hit, extract its bin span `[s_r, s_f]` of width `w = s_f - s_r + 1`.
+3. Build a `K × w` matrix `Y` where each row is a PSD slice from one frame, mean-subtracted.
+4. Compute the `K × K` sample covariance: `M = (Y @ Y.T) / w`.
+5. Compute eigenvalues: `eigs = np.linalg.eigvalsh(M)`.
+6. Compute the MP upper bound for `c = K/w`:
+```
+mp_bound = (1 + √c)² / (1 - √c)²   × COV_MME_NOISE_MARGIN
+```
+7. Map the eigenvalue ratio to confidence:
+```
+excess = max(0, λ_max/λ_min / mp_bound - 1)
+mme_confidence = tanh(excess)
+```
+
+A `tanh` squasher maps the excess ratio to [0, 1]: zero when the ratio equals the MP bound (pure noise), approaching 1 for large structured signals.
+
+---
+
+### Module B: Majority-Vote Persistence
+
+**Principle:** A genuine interference event should appear consistently across multiple frames. A false alarm is unlikely to produce the same detection fingerprint in 3 out of 5 consecutive frames.
+
+**Algorithm:**
+
+Each detection is fingerprinted by a bucket key `(c_bucket, i_bucket, w_bucket)` encoding the carrier center frequency, interference center frequency, and interference width — all quantized to 25 kHz buckets to absorb small jitter.
+
+A ring buffer of the last `VOTE_WINDOW_FRAMES = 5` frames' fingerprint sets is maintained. A detection is `majority_confirmed = True` if its key appears in at least `VOTE_CONFIRM_FRAMES = 3` of the 5 frames.
+
+---
+
+### Module C: Shoulder / Envelope-Deviation Detector
+
+**Principle:** Wide shoulder interference (adjacent-channel leakage that lifts one edge of the carrier) can evade the narrow-window bump detector because the rolling median adapts to the elevated edge. The shoulder detector examines the entire carrier at once.
+
+**Sub-test 1 — Slope Asymmetry:**
+```python
+s_L = mean(|diff(left_edge)|)    # mean absolute gradient, left 18% of carrier
+s_R = mean(|diff(right_edge)|)   # mean absolute gradient, right 18%
+asym = |s_L - s_R| / max(s_L, s_R)
+```
+If `asym > SHOULDER_ASYMMETRY_THR = 0.35`, the weaker-slope side is flagged as a shoulder lift.
+
+**Sub-test 2 — Envelope Deviation:**
+A reference level is computed as the 75th percentile of the carrier's central 60% (avoiding the potentially contaminated edges). The residual `psd - ref_level` is computed, and contiguous regions where `residual > SHOULDER_ENVELOPE_LIFT_DB = 2.0 dB` for at least `SHOULDER_MIN_LIFT_BINS = 3` bins are flagged.
+
+---
+
+### Module D: Classification Confidence
+
+Each hit is classified into one of six interference types using a feature-based soft scoring system with softmax normalization:
+
+| Class | Key Features |
+|---|---|
+| `CW` | Width ≤ 4 bins, strength ≥ 4 dB, inside carrier |
+| `shoulder` | Method starts with `'shoulder_'`, near carrier edge |
+| `overlap` | `is_gap=True` or method `'gap'`, depth ≥ 3 dB |
+| `narrowband` | Narrow, strong, near edge or outside main carrier |
+| `noise_rise` | Width > 10 bins, strength < 2.5 dB |
+| `unknown` | Residual prior |
+
+Logits are computed from feature rules, then softmax-normalized to produce a probability vector. The `top_class` field reports the argmax class.
+
+---
+
+## 9. Unauthorized Carrier Detection
+
+**File:** `backend/Interference.py`
+
+After all carrier spans are detected and their center frequencies computed, each carrier is checked against the authorized frequency database:
+
+```python
+is_auth = config_mgr.is_authorized(span_center_hz)
+```
+
+The `is_authorized()` method checks whether `span_center_hz` falls within any authorized frequency band `[center - bandwidth/2, center + bandwidth/2]` for the active antenna.
+
+**Unauthorized carrier persistence filter:**
+
+Single-frame unauthorized detections are filtered through a persistence counter:
+
+```python
+bucket = round(f_center / UNAUTH_BUCKET_HZ)   # 50 kHz buckets
+_unauth_persistence[bucket] += 1
+if _unauth_persistence[bucket] >= UNAUTH_PERSIST_FRAMES:   # 2 frames
+    confirmed.append(hit)
+```
+
+A carrier must appear as unauthorized in at least 2 consecutive frames before being reported. Buckets that disappear from the current frame are immediately removed from the persistence dictionary (no hysteresis — unauthorized carriers are reported promptly once confirmed, and cleared promptly when they disappear).
+
+**Interference classification:** For each confirmed unauthorized carrier, the `classify_interference()` function determines the relationship between the unauthorized carrier and the nearest authorized carrier:
+
+| Condition | Classification |
+|---|---|
+| Both authorized | `NOISE FLOOR RISE` |
+| Carrier unauthorized, interference authorized | `AUTHORIZED CARRIER MASKED BY UNAUTHORIZED SIGNAL` |
+| Carrier authorized, interference unauthorized, `|Δf| < 50 kHz` | `INTERFERENCE AT CARRIER CENTER` |
+| Carrier authorized, interference unauthorized, `intf_cf > carrier_cf` | `INTERFERENCE ON RIGHT OF CARRIER` |
+| Carrier authorized, interference unauthorized, `intf_cf < carrier_cf` | `INTERFERENCE ON LEFT OF CARRIER` |
+
+---
+
+## 10. Authorized Frequency Management
+
+**File:** `backend/config_manager.py` — `AuthorizedFrequencyManager` class
+
+The authorized frequency database is stored in `backend/authorized_freqs.json` as a JSON dictionary keyed by antenna ID:
+
+```json
+{
+  "gsat-30": [
+    {"center": 70500000.0, "bandwidth": 500000.0, "label": "Beacon"},
+    {"center": 71000000.0, "bandwidth": 2000000.0, "label": "Uplink-1"}
+  ],
+  "insat-4b": [...]
+}
+```
+
+**Per-antenna isolation:** Each antenna/site has its own independent frequency list. The active antenna is set via `SCIPY_ACTIVE_ANTENNA` environment variable (default: `gsat-30`). This prevents frequency lists from bleeding between assets.
+
+**Thread safety:** All read and write operations are protected by a `threading.Lock()`. The `_reload_if_changed()` method checks the file's `mtime` before each read, automatically picking up changes made by the web UI or another process without requiring a restart.
+
+**Web UI:** The manager starts a Flask web server on port 5580 (bound to `0.0.0.0`) serving an HTML management interface. Operators can add, delete, and view authorized frequencies per antenna through a browser.
+
+**REST API:**
+
+| Method | Endpoint | Action |
+|---|---|---|
+| `GET` | `/api/frequencies?antenna_id=gsat-30` | List all authorized frequencies |
+| `POST` | `/api/frequencies` | Add a frequency |
+| `DELETE` | `/api/frequencies/{idx}` | Remove a frequency |
+| `GET/POST` | `/api/active-antenna` | Get/set active antenna |
+
+---
+
+## 11. Snapshot API and Data Serialization
+
+**File:** `backend/Interference.py` — `_run_headless_snapshot_api()` and `_latest_snapshot`
+
+At the end of each `update()` call, the complete detection state is serialized into a Python dictionary and stored in `_latest_snapshot` under `_snapshot_lock`. This dictionary is the single source of truth for the frontend.
+
+**Snapshot structure:**
+
+```json
+{
+  "ts":                  float,      // Unix timestamp
+  "antenna_id":          string,     // active antenna ID
+  "hw_center_mhz":       float,      // hardware center frequency (MHz)
+  "display_center_mhz":  float,      // display center frequency (MHz)
+  "sample_rate_mhz":     float,      // sample rate (MHz)
+  "fft_size":            int,        // FFT size
+  "noise_db":            float,      // estimated noise floor (dB)
+  "detect_threshold_db": float,      // adaptive detection threshold (dB)
+  "freq_mhz":            [float],    // frequency axis array (2048 values, MHz)
+  "psd_db":              [float],    // PSD array (2048 values, dB)
+  "carriers": [{
+    "f_center_mhz":  float,
+    "f_start_mhz":   float,
+    "f_stop_mhz":    float,
+    "bw_khz":        float,
+    "is_auth":       bool,
+    "interference":  [hit_dict],
+    "cuc_hits":      [cuc_hit_dict]
+  }],
+  "unauthorized":        [unauth_dict],
+  "interference":        [intf_dict],
+  "gap_interference":    [gap_dict],
+  "stable_carriers":     [carrier_dict],
+  "unauth_count":        int,
+  "logs":                [log_line_dict]
+}
+```
+
+The `freq_mhz` and `psd_db` arrays are the full 2048-point spectrum, transmitted as JSON arrays on every poll. This is the primary data for the frontend's spectrum chart.
+
+**Flask API endpoints (port 8766):**
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/snapshot` | GET | Returns the latest snapshot JSON |
+| `/api/health` | GET | Returns `{"status": "ok", "headless": true}` |
+| `/api/set_smoothing` | POST | Adjusts EMA smoothing parameters |
+
+CORS headers (`Access-Control-Allow-Origin: *`) are added to all responses, enabling cross-origin requests from the frontend running on a different machine.
+
+---
+
+## 12. Orchestrator and Process Management
+
+**File:** `backend/orchestrator.py`
+
+The Orchestrator is a Flask application (port 8780) that serves as the single HTTP control plane for the frontend. It manages the lifecycle of the GNU Radio flowgraph and the Interference detector as child processes, and proxies API calls between the frontend and the detector.
+
+**Process management:**
+
+```python
+_sdr_proc: subprocess.Popen | None   # sdr_scipy.py
+_det_proc: subprocess.Popen | None   # Interference.py (SCIPY_HEADLESS=1)
+```
+
+**Key endpoints:**
+
+| Endpoint | Method | Action |
+|---|---|---|
+| `/api/status` | GET | Returns process status (running/stopped) |
+| `/api/monitor/start` | POST | Starts both `sdr_scipy.py` and `Interference.py` |
+| `/api/monitor/stop` | POST | Terminates both processes |
+| `/api/snapshot` | GET | Proxies to `http://127.0.0.1:8766/api/snapshot` |
+| `/api/frequencies` | GET/POST | Proxies to config_manager (port 5580) |
+
+**Proxy behavior:** The orchestrator forwards `/api/snapshot` requests to the detector's Flask API on port 8766 using `urllib.request`. This means the frontend only needs to know the orchestrator's IP and port (8780) — it never directly addresses the detector or config manager.
+
+**CORS:** All responses include `Access-Control-Allow-Origin: *`, enabling the React frontend on a separate machine to make cross-origin requests.
+
+**Binding:** After the fix applied in this deployment, the orchestrator binds to `host="0.0.0.0"`, accepting connections from any network interface (LAN accessible).
+
+---
+
+## 13. Frontend Architecture and Data Flow
+
+**Directory:** `Frontend1/src/`
+
+The frontend is a React 18 + TypeScript application built with Vite, using TanStack Query for data fetching and Recharts for spectrum visualization.
+
+### API Client (`src/lib/cmsApi.ts`)
+
+The API client maintains a global `currentPiIp` variable set by `setApiTarget(piIpAddress)`. The base URL for all API calls is determined dynamically:
+
+```typescript
+function getApiBaseUrl(): string {
+  if (!currentPiIp || currentPiIp === '127.0.0.1' || currentPiIp.includes('(')) {
+    return '/api';           // Vite dev proxy → localhost:8780
+  }
+  return `http://${currentPiIp}:8780/api`;   // direct LAN connection
+}
+```
+
+This allows the same frontend build to work in both local development (via Vite proxy) and LAN deployment (direct IP) without code changes.
+
+### Polling Architecture
+
+The frontend polls the `/api/snapshot` endpoint every 400 ms using `setInterval + fetch()`. There is no WebSocket or Server-Sent Events — the system uses pure HTTP polling. This is a deliberate choice for simplicity and firewall compatibility.
+
+```typescript
+// Polling interval: 400ms
+const interval = setInterval(async () => {
+  const snapshot = await fetchSnapshot();
+  updateState(snapshot);
+}, 400);
+```
+
+### Spectrum Chart (`src/components/monitoring/SpectrumChart.tsx`)
+
+The spectrum chart renders the 2048-point `psd_db` array from the snapshot as a line chart using Recharts. The `freq_mhz` array provides the X-axis. Carrier spans, interference regions, and unauthorized carriers are overlaid as colored rectangles using SVG `<rect>` elements positioned using the chart's coordinate system.
+
+### Vite Proxy Configuration (`vite.config.ts`)
+
+In development mode, all `/api/*` requests are proxied by Vite to `http://127.0.0.1:8780`:
+
+```typescript
+proxy: {
+  "/api": {
+    target: "http://127.0.0.1:8780",
+    changeOrigin: true,
+  },
+},
+```
+
+The Vite dev server binds to `host: "::"` (all IPv4 and IPv6 interfaces), making the frontend accessible from any machine on the LAN at `http://FRONTEND_IP:8080`.
+
+### Satellite Management (`src/data/satellites.ts`, `src/components/dashboard/`)
+
+Each satellite entry has a `piIpAddress` field. When a satellite is selected in the dashboard, `setApiTarget(satellite.piIpAddress)` is called, routing all subsequent API calls to that satellite's Raspberry Pi. This enables a single frontend instance to monitor multiple independent SDR deployments by switching between satellites.
+
+---
+
+## 14. End-to-End Data Flow Summary
+
+The following describes the complete path of data from the RF antenna to the browser display, with the processing applied at each stage.
+
+```
+RF Signal (C-Band / Ku-Band / S-Band)
+    │
+    ▼
+HackRF One (SDR Hardware)
+    │  ADC at 20 MHz sample rate, center freq 70 MHz
+    │  Output: complex64 IQ samples
+    ▼
+GNU Radio Flowgraph (sdr_scipy.py)
+    │  SoapySDR driver → soapy_source_0
+    │  Gain: 20.6 dB, BW: 20 MHz
+    │  ZMQ PUB Sink → tcp://0.0.0.0:5555
+    ▼
+ZMQ Transport Layer (tcp, CONFLATE=1)
+    │  Only latest frame retained
+    │  Resilient reconnection on network failure
+    ▼
+DataFetcher Thread (Interference.py)
+    │  Polls IQ (5555), metadata (5556), carrier hints (5557)
+    │  Stores under _state_lock
+    ▼
+update() — called every 33ms
+    │
+    ├─ [1] Hann window × IQ buffer (2048 samples)
+    │       Reduces spectral leakage
+    │
+    ├─ [2] FFT → fftshift → |·| → 20·log₁₀
+    │       Output: PSD[2048] in dB
+    │
+    ├─ [3] EMA smoothing (optional, α configurable)
+    │       display_psd = α·psd_avg + (1-α)·psd
+    │
+    ├─ [4] Box-filter smoothing (smooth_taps bins)
+    │       psd_s = convolve(display_psd, ones/taps)
+    │
+    ├─ [5] Adaptive noise floor estimation
+    │       Rolling 15th-percentile, window=256 bins
+    │       noise = median of window floors
+    │
+    ├─ [6] Adaptive detection threshold
+    │       detect_threshold = noise + max(2.5, 3.5·σ_noise)
+    │
+    ├─ [7] Binary carrier mask: above = psd_s > detect_threshold
+    │
+    ├─ [8] Morphological opening (3-bin kernel) → spike removal
+    │       Morphological closing (5-bin kernel) → gap bridging
+    │
+    ├─ [9] Hysteresis thresholding
+    │       Each region must have ≥1 bin above detect_threshold + 4 dB
+    │
+    ├─ [10] Connected region extraction → raw_spans [(r,f), ...]
+    │
+    ├─ [11] Adaptive carrier merging
+    │        Gap < 0.5 × min(bw1, bw2) → merge
+    │
+    ├─ [12] Isolated spike detection (SPIKE_MIN_SNR=10 dB)
+    │
+    ├─ [13] Valley detection → carrier splitting
+    │        Each span checked for V/U valleys → sub-spans
+    │
+    ├─ [14] Per-carrier loop:
+    │    │
+    │    ├─ [14a] Edge walk → precise Hz boundaries
+    │    │
+    │    ├─ [14b] Authorization check (config_manager)
+    │    │
+    │    ├─ [14c] detect_interference_in_carrier()
+    │    │         → bump, variance, curvature, edge, subband_var,
+    │    │           level_shift, gap detectors
+    │    │
+    │    ├─ [14d] detect_cuc_in_carrier() (CuC pipeline)
+    │    │         → template build → SIC residual →
+    │    │           bump + HOS kurtosis + curvature → confidence fusion
+    │    │
+    │    └─ [14e] ConfidenceEngine.augment()
+    │              → MME covariance confidence
+    │              → majority-vote persistence
+    │              → shoulder detector
+    │              → classification probabilities
+    │
+    ├─ [15] DetectionTracker.update() for each category
+    │        Debounce (3 frames ON, 5 frames OFF)
+    │        Confidence = 0.65·persistence + 0.35·stability
+    │
+    ├─ [16] Unauthorized carrier persistence filter
+    │        2-frame persistence, 50 kHz buckets
+    │
+    └─ [17] Snapshot serialization → _latest_snapshot dict
+             freq_mhz[2048], psd_db[2048], carriers[], interference[],
+             unauthorized[], cuc_hits[], logs[]
+
+    ▼
+Flask API (port 8766) — GET /api/snapshot
+    │  Returns JSON snapshot, CORS headers
+    ▼
+Orchestrator (port 8780) — GET /api/snapshot
+    │  Proxies to port 8766
+    │  CORS headers, LAN accessible (0.0.0.0)
+    ▼
+HTTP over LAN (every 400ms)
+    ▼
+React Frontend (port 8080)
+    │  cmsApi.ts → fetch(getApiBaseUrl() + '/snapshot')
+    │  TanStack Query → state update
+    ▼
+SpectrumChart.tsx
+    │  Recharts line chart: freq_mhz vs psd_db
+    │  SVG overlays: carrier spans, interference regions, unauthorized carriers
+    ▼
+Browser Display
+```
+
+---
+
+## Key Configuration Parameters Reference
+
+| Parameter | Value | Location | Effect |
+|---|---|---|---|
+| `FFT_SIZE` | 2048 | Interference.py | Frequency resolution: 20MHz/2048 ≈ 9.77 kHz/bin |
+| `HW_SAMPLE_RATE` | 20 MHz | Interference.py | Observed bandwidth |
+| `NF_PERCENTILE` | 15.0 | Interference.py | Noise floor estimation aggressiveness |
+| `CARRIER_K_SIGMA` | 3.5 | Interference.py | Carrier detection sensitivity (σ multiplier) |
+| `MORPH_OPEN_BINS` | 3 | Interference.py | Minimum carrier width to survive opening |
+| `MORPH_CLOSE_BINS` | 5 | Interference.py | Maximum intra-carrier gap to bridge |
+| `INTF_BUMP_THRESHOLD_DB` | 3 dB | Interference.py | Minimum bump height to flag |
+| `INTF_VARIANCE_SIGMA` | 2.5 | Interference.py | Variance anomaly sensitivity |
+| `INTF_CUC_CURV_SIGMA` | 3.5 | Interference.py | Curvature anomaly sensitivity |
+| `CUC_CONFIDENCE_THRESHOLD` | 0.40 | cuc_detector.py | Minimum CuC confidence to report |
+| `STABILITY_DEBOUNCE_ON` | 3 frames | Interference.py | Frames before detection is confirmed |
+| `STABILITY_DEBOUNCE_OFF` | 5 frames | Interference.py | Frames before detection is cleared |
+| `STABILITY_CONFIDENCE_MIN` | 0.60 | Interference.py | Minimum tracker confidence to report |
+| `API_PORT` | 8766 | Interference.py | Snapshot API port |
+| `ORCHESTRATOR_PORT` | 8780 | orchestrator.py | Orchestrator API port |
+
+---
+
+*This document was generated from source code analysis of the ISTRAC SDR Interference Detection System.*
