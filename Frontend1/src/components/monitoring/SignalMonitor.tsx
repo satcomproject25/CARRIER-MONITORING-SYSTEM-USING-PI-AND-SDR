@@ -188,9 +188,10 @@ export const SignalMonitor = () => {
 
     const tick = async () => {
       try {
-        const [health, snap] = await Promise.all([cmsHealth(), cmsFetchSnapshot()]);
+        const snap = await cmsFetchSnapshot();
+        const health = { detector_running: !snap.error && !!(snap.psd_db?.length) };
         const hasPsd = !!(snap.psd_db?.length && snap.freq_mhz?.length);
-        const ok = health.detector_running && hasPsd && !snap.error;
+        const ok = health.detector_running && hasPsd;
         setPiConnected(ok);
 
         if (!hasPsd || snap.error) {
@@ -266,7 +267,7 @@ export const SignalMonitor = () => {
     };
 
     void tick();
-    intervalRef.current = setInterval(() => void tick(), 400);
+    intervalRef.current = setInterval(() => void tick(), 150);
     return () => clearInterval(intervalRef.current);
   }, [sat, isLiveBackend, enableMaxHold, enableMinHold, smoothEnabled, smoothAlpha]);
 

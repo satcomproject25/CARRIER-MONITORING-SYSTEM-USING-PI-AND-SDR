@@ -12,6 +12,7 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 400 });
   const [mousePos, setMousePos] = useState<{ x: number; y: number; freq: number; power: number } | null>(null);
+  const lastDimRef = useRef({ width: 0, height: 0 });
 
   // Margins for the plot area
   const margin = { top: 30, right: 20, bottom: 40, left: 55 };
@@ -74,6 +75,12 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
     canvas.height = dimensions.height;
 
     const { CENTER_FREQ, DISPLAY_BW, Y_MIN, Y_MAX } = DSP_CONFIG;
+    // Only reset canvas size when dimensions actually change — avoids GPU flush on every frame
+    if (lastDimRef.current.width !== dimensions.width || lastDimRef.current.height !== dimensions.height) {
+      canvas.width = dimensions.width;
+      canvas.height = dimensions.height;
+      lastDimRef.current = { width: dimensions.width, height: dimensions.height };
+    }
     const fMin = (CENTER_FREQ - DISPLAY_BW / 2) / 1e6;
     const fMax = (CENTER_FREQ + DISPLAY_BW / 2) / 1e6;
     const plotW = dimensions.width - margin.left - margin.right;

@@ -2638,8 +2638,8 @@ def update():
                 "noise_db": float(noise),
                 "detect_threshold_db": float(detect_threshold),
                 "threshold_compat_db": float(threshold),
-                "freq_mhz": (freq_axis / 1e6).astype(float).tolist(),
-                "psd_db": display_psd.astype(float).tolist(),
+                "freq_mhz": (freq_axis[::4] / 1e6).astype(float).tolist(),
+                "psd_db": display_psd[::4].astype(float).tolist(),
                 "carriers": _rr_out,
                 "unauthorized": _unauth_out,
                 "interference": _intf_s,
@@ -2720,7 +2720,7 @@ if __name__ == "__main__":
         try:
             while not _headless_stop.is_set():
                 update()
-                time.sleep(0.033)
+                time.sleep(0.020)
         except KeyboardInterrupt:
             _headless_stop.set()
         fetcher.stop()
