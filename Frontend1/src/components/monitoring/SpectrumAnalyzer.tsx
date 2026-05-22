@@ -29,12 +29,14 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
   }, []);
 
   const freqToX = useCallback((freq: number) => {
-    const { CENTER_FREQ, DISPLAY_BW } = DSP_CONFIG;
-    const fMin = (CENTER_FREQ - DISPLAY_BW / 2) / 1e6;
-    const fMax = (CENTER_FREQ + DISPLAY_BW / 2) / 1e6;
+    // Use actual frequency axis from data if available, fall back to DSP_CONFIG
+    const fMinHz = data?.freqAxis?.length ? data.freqAxis[0] : (DSP_CONFIG.CENTER_FREQ - DSP_CONFIG.DISPLAY_BW / 2);
+    const fMaxHz = data?.freqAxis?.length ? data.freqAxis[data.freqAxis.length - 1] : (DSP_CONFIG.CENTER_FREQ + DSP_CONFIG.DISPLAY_BW / 2);
+    const fMin = fMinHz / 1e6;
+    const fMax = fMaxHz / 1e6;
     const plotW = dimensions.width - margin.left - margin.right;
     return margin.left + ((freq / 1e6 - fMin) / (fMax - fMin)) * plotW;
-  }, [dimensions.width]);
+  }, [dimensions.width, data?.freqAxis]);
 
   const powerToY = useCallback((power: number) => {
     const { Y_MIN, Y_MAX } = DSP_CONFIG;
@@ -51,9 +53,11 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
 
     const plotW = dimensions.width - margin.left - margin.right;
     const plotH = dimensions.height - margin.top - margin.bottom;
-    const { CENTER_FREQ, DISPLAY_BW, Y_MIN, Y_MAX } = DSP_CONFIG;
-    const fMin = (CENTER_FREQ - DISPLAY_BW / 2) / 1e6;
-    const fMax = (CENTER_FREQ + DISPLAY_BW / 2) / 1e6;
+    const { Y_MIN, Y_MAX } = DSP_CONFIG;
+    const fMinHz = data.freqAxis?.length ? data.freqAxis[0] : (DSP_CONFIG.CENTER_FREQ - DSP_CONFIG.DISPLAY_BW / 2);
+    const fMaxHz = data.freqAxis?.length ? data.freqAxis[data.freqAxis.length - 1] : (DSP_CONFIG.CENTER_FREQ + DSP_CONFIG.DISPLAY_BW / 2);
+    const fMin = fMinHz / 1e6;
+    const fMax = fMaxHz / 1e6;
 
     if (x >= margin.left && x <= margin.left + plotW && y >= margin.top && y <= margin.top + plotH) {
       const freq = fMin + ((x - margin.left) / plotW) * (fMax - fMin);
@@ -74,15 +78,12 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
     canvas.width = dimensions.width;
     canvas.height = dimensions.height;
 
-    const { CENTER_FREQ, DISPLAY_BW, Y_MIN, Y_MAX } = DSP_CONFIG;
-    // Only reset canvas size when dimensions actually change — avoids GPU flush on every frame
-    if (lastDimRef.current.width !== dimensions.width || lastDimRef.current.height !== dimensions.height) {
-      canvas.width = dimensions.width;
-      canvas.height = dimensions.height;
-      lastDimRef.current = { width: dimensions.width, height: dimensions.height };
-    }
-    const fMin = (CENTER_FREQ - DISPLAY_BW / 2) / 1e6;
-    const fMax = (CENTER_FREQ + DISPLAY_BW / 2) / 1e6;
+    const { Y_MIN, Y_MAX } = DSP_CONFIG;
+    // Use actual frequency axis from snapshot if available
+    const fMinHz = data.freqAxis?.length ? data.freqAxis[0] : (DSP_CONFIG.CENTER_FREQ - DSP_CONFIG.DISPLAY_BW / 2);
+    const fMaxHz = data.freqAxis?.length ? data.freqAxis[data.freqAxis.length - 1] : (DSP_CONFIG.CENTER_FREQ + DSP_CONFIG.DISPLAY_BW / 2);
+    const fMin = fMinHz / 1e6;
+    const fMax = fMaxHz / 1e6;
     const plotW = dimensions.width - margin.left - margin.right;
     const plotH = dimensions.height - margin.top - margin.bottom;
 
@@ -141,56 +142,75 @@ export const SpectrumAnalyzer = ({ data, enableMaxHold, enableMinHold }: Props) 
     ctx.textAlign = 'left';
     ctx.fillText('Real-Time FFT Spectrum + Carrier Detection', margin.left, 18);
 
-    // Carrier highlights — authorized: green; unauthorized / unauth hits: red
+    // ── LAYER 1: Interference fills (behind everything, low alpha) ──
+    for (const intf of data.interferences) {
+      const x1 = freqToX(intf.startFreq);
+      const x2 = freqToX(intf.endFreq);
+      ctx.fillStyle = intf.isGap ? 'rgba(239, 68, 68, 0.55)' : 'rgba(239, 68, 68, 0.35)';
+      ctx.fillRect(x1, margin.top, x2 - x1, plotH);
+    }
+
+    // ── LAYER 2: Carrier highlights (on top of interference fills) ──
     for (const carrier of data.carriers) {
       const x1 = freqToX(carrier.startFreq);
       const x2 = freqToX(carrier.endFreq);
       const auth = carrier.isAuthorized !== false;
 
-      ctx.fillStyle = auth ? 'rgba(34, 197, 94, 0.2)' : 'rgba(239, 68, 68, 0.28)';
+      // Match backend: green alpha=0.25, red alpha=0.40
+      ctx.fillStyle = auth ? 'rgba(34, 197, 94, 0.25)' : 'rgba(239, 68, 68, 0.40)';
       ctx.fillRect(x1, margin.top, x2 - x1, plotH);
 
-      ctx.strokeStyle = auth ? 'rgba(249, 115, 22, 0.8)' : 'rgba(248, 113, 113, 0.9)';
+      // Match backend: orange edge lines for all carriers
+      ctx.strokeStyle = 'rgba(249, 115, 22, 0.85)';
       ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x1, margin.top);
-      ctx.lineTo(x1, margin.top + plotH);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(x2, margin.top);
-      ctx.lineTo(x2, margin.top + plotH);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1, margin.top); ctx.lineTo(x1, margin.top + plotH); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x2, margin.top); ctx.lineTo(x2, margin.top + plotH); ctx.stroke();
 
+      // Label
       const cx = (x1 + x2) / 2;
       const bwKHz = carrier.bandwidth / 1e3;
       ctx.font = '9px JetBrains Mono, monospace';
       ctx.textAlign = 'center';
-
-      const labelText = auth ? `${bwKHz.toFixed(0)} kHz` : `UNAUTH ${bwKHz.toFixed(0)} kHz`;
+      const labelText = auth ? `${bwKHz.toFixed(0)} kHz` : `UNAUTH\n${bwKHz.toFixed(0)} kHz`;
       const labelW = ctx.measureText(labelText).width + 8;
-      ctx.fillStyle = auth ? 'rgba(34, 197, 94, 0.85)' : 'rgba(239, 68, 68, 0.9)';
+      ctx.fillStyle = auth ? 'rgba(255,255,255,0.85)' : 'rgba(239, 68, 68, 0.9)';
       ctx.fillRect(cx - labelW / 2, margin.top + 3, labelW, 14);
       ctx.fillStyle = auth ? '#000' : '#fff';
       ctx.fillText(labelText, cx, margin.top + 13);
     }
 
-    // Draw interference highlights (red spans)
+    // ── LAYER 3: Interference border lines + labels (topmost) ──
     for (const intf of data.interferences) {
       const x1 = freqToX(intf.startFreq);
       const x2 = freqToX(intf.endFreq);
-
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.35)';
-      ctx.fillRect(x1, margin.top, x2 - x1, plotH);
-
       const cx = (x1 + x2) / 2;
-      const labelText = `INTF ${intf.strengthDb.toFixed(1)}dB`;
-      const labelW = ctx.measureText(labelText).width + 8;
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.9)';
-      ctx.fillRect(cx - labelW / 2, margin.top + 20, labelW, 14);
-      ctx.fillStyle = '#fff';
+
+      if (intf.isGap) {
+        // Gap: dashed #ff6666 boundary lines
+        ctx.strokeStyle = 'rgba(255, 102, 102, 0.9)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(x1, margin.top); ctx.lineTo(x1, margin.top + plotH); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x2, margin.top); ctx.lineTo(x2, margin.top + plotH); ctx.stroke();
+        ctx.setLineDash([]);
+      } else {
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.7)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x1, margin.top); ctx.lineTo(x1, margin.top + plotH); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x2, margin.top); ctx.lineTo(x2, margin.top + plotH); ctx.stroke();
+      }
+
+      const labelText = intf.isGap
+        ? `GAP-INTF\n${intf.strengthDb.toFixed(1)}dB`
+        : `INTF\n${intf.strengthDb.toFixed(1)}dB`;
       ctx.font = '8px JetBrains Mono, monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(labelText, cx, margin.top + 30);
+      const labelW = ctx.measureText(labelText).width + 8;
+      const labelY = intf.isGap ? margin.top + 36 : margin.top + 20;
+      ctx.fillStyle = intf.isGap ? 'rgba(0,0,0,0.85)' : 'rgba(239, 68, 68, 0.9)';
+      ctx.fillRect(cx - labelW / 2, labelY, labelW, 14);
+      ctx.fillStyle = intf.isGap ? '#ff4444' : '#fff';
+      ctx.fillText(labelText, cx, labelY + 10);
     }
 
     // Draw noise floor line

@@ -53,7 +53,7 @@ export const SignalMonitor = () => {
   const [latestMetrics, setLatestMetrics] = useState<SignalData | undefined>();
   const [authorizedList, setAuthorizedList] = useState<Array<{ center: number; bandwidth: number; label?: string }>>([]);
   const [cfMHz, setCfMHz] = useState('');
-  const [bwKHz, setBwKHz] = useState('500');
+  const [bwKHz, setBwKHz] = useState('2000');
   const [authLabel, setAuthLabel] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
 
@@ -506,10 +506,8 @@ export const SignalMonitor = () => {
                       const centerMhz = parseFloat(ifMhz);
                       if (!isFinite(centerMhz) || centerMhz <= 0) { skipped++; continue; }
 
-                      // Derive BW from data rate if available (rough: 1.2 × data_rate kHz), else default 500 kHz
-                      let bwKhz = 500;
-                      const drKbps = parseFloat(bwRaw);
-                      if (isFinite(drKbps) && drKbps > 0) bwKhz = Math.round(drKbps * 1.2);
+                      // BW stored for display only — use 2000 kHz (±1 MHz) to match auth tolerance
+                      const bwKhz = 2000;
 
                       const label = [tx, rx].filter(Boolean).join('-') || `CF-${centerMhz}`;
 

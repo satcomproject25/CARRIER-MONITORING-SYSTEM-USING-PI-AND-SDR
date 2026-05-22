@@ -10,8 +10,8 @@ export const DSP_CONFIG = {
   HW_SAMPLE_RATE: 20e6,
   DISPLAY_BW: 20e6,
   CENTER_FREQ: 70e6,
-  Y_MIN: -70,
-  Y_MAX: 80,
+  Y_MIN: -140,
+  Y_MAX: 10,
 
   // Noise floor
   NF_PERCENTILE: 15.0,

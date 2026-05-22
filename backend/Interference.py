@@ -104,8 +104,8 @@ SMOOTH_BW_HZ = 5 * (20e6 / 2048)
 MIN_CARRIER_BW_HZ = 5 * (20e6 / 2048)
 THRESHOLD_RATIO = 0.35
 
-Y_MIN = -70
-Y_MAX = 80
+Y_MIN = -140
+Y_MAX = 10
 
 # =====================================================
 # ADAPTIVE DETECTION CONFIG — IMPROVEMENT 1
@@ -115,8 +115,8 @@ NF_PERCENTILE            = 15.0   # rolling noise floor percentile (lower = cons
 NF_ROLLING_WINDOW_DIV    = 8      # noise window = FFT_SIZE // this value
 CARRIER_K_SIGMA          = 3.5    # adaptive carrier threshold: noise + k·σ
 MORPH_OPEN_BINS          = 3      # morphological open kernel size (spike removal)
-MORPH_CLOSE_BINS         = 5      # morphological close kernel size (gap filling)
-ADAPTIVE_MERGE_BW_FACTOR = 0.5    # merge gap < this × min(bw1, bw2)
+MORPH_CLOSE_BINS         = 9      # morphological close kernel size (gap filling) — increased from 5 to bridge wider notches in continuous carriers
+ADAPTIVE_MERGE_BW_FACTOR = 0.8    # merge gap < this × min(bw1, bw2) — increased from 0.5 for more aggressive merging
 
 # =====================================================
 # INTERFERENCE DETECTION CONFIG (intra-carrier)
@@ -128,7 +128,7 @@ INTF_ENVELOPE_ORDER    = 9
 INTF_VARIANCE_WINDOW   = 7
 INTF_VARIANCE_SIGMA    = 2.5
 INTF_CUC_CURV_SIGMA    = 3.5
-INTF_MERGE_GAP_HZ      = 200e3
+INTF_MERGE_GAP_HZ      = 50e3
 
 # Level-shift detector (carrier-on-carrier / co-channel interference)
 # Detects flat elevated regions that evade bump/variance/curvature detectors
@@ -152,8 +152,8 @@ GAP_ENABLED            = True
 # =====================================================
 # VALLEY / CARRIER SPLIT DETECTION CONFIG
 # =====================================================
-VALLEY_DEPTH_DB        = 3.0
-VALLEY_MIN_WIDTH_HZ    = 10e3
+VALLEY_DEPTH_DB        = 6.0      # min dip depth to split a carrier — raised from 3.0 to avoid splitting continuous carriers with shallow ripple
+VALLEY_MIN_WIDTH_HZ    = 50e3     # min valley width to split — raised from 10 kHz to avoid false splits
 VALLEY_ENABLED         = True
 
 # =====================================================
@@ -1859,11 +1859,22 @@ def update():
     iq_buffer[:] = iq[:FFT_SIZE]
 
     # FFT -> PSD
+    # Normalize to match GNU Radio's freq sink output (dBFS, Hann window corrected).
+    # GNU Radio applies: divide by FFT_SIZE, then correct for window power loss.
+    # Without this, the PSD reads ~70 dB too high (noise at -20 dB instead of -90 dB).
+    #
+    # Normalization steps:
+    #   1. Divide FFT output by FFT_SIZE  → removes the FFT size gain
+    #   2. Divide by window coherent gain → corrects for Hann window amplitude loss
+    #      (coherent gain = mean(window) = sum(window)/N ≈ 0.5 for Hann)
+    #   3. 20*log10 → convert to dB
+    #
+    # Result: a full-scale sine wave → 0 dBFS, noise floor → ~-90 dBFS,
+    # matching the GNU Radio frequency sink display.
+    _win_coherent_gain = float(np.mean(window))   # ≈ 0.5 for Hann
+    _norm = FFT_SIZE * _win_coherent_gain
     spectrum = np.fft.fftshift(np.fft.fft(iq_buffer * window))
-    psd      = 20 * np.log10(np.abs(spectrum) + 1e-12)
-    # NOTE: artificial noise injection removed — it caused display jitter and
-    # made the frontend graph noisy even when the real signal was clean.
-    # The real SDR hardware already provides natural noise via the IQ samples.
+    psd      = 20 * np.log10(np.abs(spectrum) / _norm + 1e-12)
 
     # SMOOTH
     if psd_avg is None: psd_avg = psd.copy()
@@ -2471,18 +2482,17 @@ def update():
         gap_hits    = [h for h in intf_hits if h.get('is_gap', False)]
         nongap_hits = [h for h in intf_hits if not h.get('is_gap', False)]
 
-        # Draw non-gap interference
+        # Draw non-gap interference — each hit drawn separately so multiple
+        # interference regions within one carrier are shown individually.
         if nongap_hits:
-            ids = min(h['start_freq'] for h in nongap_hits)
-            ide = max(h['end_freq']   for h in nongap_hits)
-            # Clip to this sub-carrier's display boundaries
-            ids = max(ids, f_start)
-            ide = min(ide, f_stop)
-            if ide > ids:
-                best           = max(nongap_hits, key=lambda h: h['strength_db'])
-                # LOG FIX: use strongest hit's actual peak_freq, not merged span midpoint
-                intf_center_visual = 0.5 * (ids + ide)   # for overlay drawing position
-                intf_center_log    = best['peak_freq']    # actual detected frequency for log
+            for _hit in nongap_hits:
+                ids = max(_hit['start_freq'], f_start)
+                ide = min(_hit['end_freq'],   f_stop)
+                if ide <= ids:
+                    continue
+
+                intf_center_log = _hit['peak_freq']
+                intf_center_visual = 0.5 * (ids + ide)
                 classification = classify_interference(f_center, intf_center_log)
                 carrier_auth = config_mgr.is_authorized(f_center)
                 intf_auth    = config_mgr.is_authorized(intf_center_log)
@@ -2491,15 +2501,13 @@ def update():
                 if not carrier_auth and not intf_auth:
                     pass  # detection still happens, but do not draw highlight
                 else:
-
                     intf_color = ("green"
                                   if classification == "AUTHORIZED CARRIER MASKED BY UNAUTHORIZED SIGNAL"
                                   else "red")
 
                     ax.axvspan(ids/1e6, ide/1e6, color=intf_color, alpha=0.35, zorder=7)
-
                     ax.text(intf_center_visual/1e6, Y_MAX - 10,
-                            f"INTF\n{best['strength_db']:.1f}dB",
+                            f"INTF\n{_hit['strength_db']:.1f}dB",
                             ha="center", va="top", fontsize=7, color="white",
                             bbox=dict(boxstyle="round", fc=intf_color, alpha=0.8), zorder=10)
 
@@ -2507,8 +2515,8 @@ def update():
                     if f_start <= intf_center_log <= f_stop:
                         _all_intf_dets.append({
                             'center_freq': intf_center_log,
-                            'strength_db': best['strength_db'],
-                            'method': best['method'],
+                            'strength_db': _hit['strength_db'],
+                            'method': _hit['method'],
                             'ids': ids, 'ide': ide,
                             'classification': classification,
                             'parent_carrier_id': carrier_id,

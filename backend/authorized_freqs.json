@@ -2,34 +2,34 @@
   "gsat-30": [
     {
       "center": 70000000.0,
-      "bandwidth": 13000.0,
+      "bandwidth": 2000000.0,
       "label": "MOX-SHAR"
     },
     {
       "center": 66500000.0,
-      "bandwidth": 500000.0,
+      "bandwidth": 2000000.0,
       "label": ""
     },
     {
       "center": 65500000.0,
-      "bandwidth": 500000.0,
+      "bandwidth": 2000000.0,
       "label": ""
     },
     {
       "center": 74600000.0,
-      "bandwidth": 500000.0,
+      "bandwidth": 2000000.0,
       "label": ""
     }
   ],
   "insat-4b": [
     {
       "center": 66000000.0,
-      "bandwidth": 500000.0,
+      "bandwidth": 2000000.0,
       "label": ""
     },
     {
       "center": 65200000.0,
-      "bandwidth": 500000.0,
+      "bandwidth": 2000000.0,
       "label": ""
     }
   ]
