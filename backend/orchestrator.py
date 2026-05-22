@@ -25,6 +25,25 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request
 
+# Load .env file from the backend directory if it exists
+# This makes LOG_SSD_PATH and other env vars available without manual export
+def _load_dotenv(env_path):
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:  # don't override existing env vars
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+_load_dotenv(Path(__file__).resolve().parent / ".env")
+
 BACKEND_DIR = Path(os.environ.get("SCIPY_BACKEND_DIR", Path(__file__).resolve().parent))
 SNAPSHOT_PORT = int(os.environ.get("SCIPY_SNAPSHOT_PORT", "8766"))
 ORCHESTRATOR_PORT = int(os.environ.get("SCIPY_ORCHESTRATOR_PORT", "8780"))
@@ -184,6 +203,45 @@ def set_smoothing_proxy():
         )
         with urllib.request.urlopen(req, timeout=2.0) as r:
             return (r.read(), 200, {"Content-Type": "application/json"})
+    except urllib.error.URLError as e:
+        return jsonify({"error": "detector_unreachable", "detail": str(e)}), 503
+
+
+@app.route("/api/logs_full", methods=["GET"])
+def logs_full_proxy():
+    url = f"http://127.0.0.1:{SNAPSHOT_PORT}/api/logs_full"
+    try:
+        with urllib.request.urlopen(url, timeout=5.0) as r:
+            return (r.read(), 200, {"Content-Type": "application/json"})
+    except urllib.error.URLError as e:
+        return jsonify({"error": "detector_unreachable", "detail": str(e)}), 503
+
+
+@app.route("/api/export_logs", methods=["GET"])
+def export_logs_proxy():
+    # Forward all query params (antenna, date, start, end) to the detector
+    qs = urllib.parse.urlencode(request.args) if request.args else ""
+    url = f"http://127.0.0.1:{SNAPSHOT_PORT}/api/export_logs"
+    if qs:
+        url = f"{url}?{qs}"
+    try:
+        with urllib.request.urlopen(url, timeout=15.0) as r:
+            data = r.read()
+            # Extract filename from Content-Disposition if present
+            cd = r.headers.get("Content-Disposition", "")
+            fname = "interference_logs.xlsx"
+            if 'filename="' in cd:
+                fname = cd.split('filename="')[1].rstrip('"')
+            return (
+                data,
+                200,
+                {
+                    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "Content-Disposition": f'attachment; filename="{fname}"',
+                },
+            )
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": "export_failed", "detail": str(e)}), e.code
     except urllib.error.URLError as e:
         return jsonify({"error": "detector_unreachable", "detail": str(e)}), 503
 

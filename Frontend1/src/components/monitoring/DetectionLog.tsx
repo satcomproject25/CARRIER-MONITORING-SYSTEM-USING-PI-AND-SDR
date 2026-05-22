@@ -1,15 +1,18 @@
 import { useRef, useEffect, useState } from 'react';
 import { LogEntry } from '@/lib/dspEngine';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { cmsExportLogs } from '@/lib/cmsApi';
 
 interface Props {
   logs: LogEntry[];
   onClear: () => void;
+  isLiveBackend?: boolean;
+  antennaId?: string;
 }
 
 const MAX_LOGS = 5000;
 
-export const DetectionLog = ({ logs, onClear }: Props) => {
+export const DetectionLog = ({ logs, onClear, isLiveBackend = false, antennaId }: Props) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const isScrollingRef = useRef(false);
@@ -94,6 +97,20 @@ export const DetectionLog = ({ logs, onClear }: Props) => {
           >
             Auto-scroll: {autoScroll ? 'ON' : 'OFF'}
           </button>
+          {isLiveBackend && (
+            <button
+              onClick={() => {
+                void cmsExportLogs(antennaId).catch((e: unknown) => {
+                  const msg = e instanceof Error ? e.message : 'Export failed';
+                  alert(msg);
+                });
+              }}
+              className="text-[10px] font-mono px-2 py-1 rounded border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/60 transition-colors"
+              title="Export today's full log as Excel"
+            >
+              Export XLSX
+            </button>
+          )}
           <button
             onClick={onClear}
             className="text-[10px] font-mono px-2 py-1 rounded border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/60 transition-colors"

@@ -170,6 +170,63 @@ export async function cmsDeleteAuthorizedFrequency(antennaId: string, index: num
   });
 }
 
+/**
+ * Fetch the full in-memory log buffer from the backend.
+ * Call once on monitor mount to restore history after navigation.
+ */
+export async function cmsGetFullLogs(): Promise<Array<{ msg: string; color?: string }>> {
+  const baseUrl = getApiBaseUrl();
+  try {
+    const r = await fetch(`${baseUrl}/logs_full`);
+    if (!r.ok) return [];
+    const j = (await r.json()) as { logs?: Array<{ msg: string; color?: string }> };
+    return j.logs ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Trigger a browser download of the day's Excel log file.
+ * Uses fetch → blob → object URL so it works correctly through the Vite proxy.
+ * @param antenna  antenna id (e.g. "gsat-30")
+ * @param dateStr  YYYY-MM-DD (defaults to today)
+ * @param startTs  optional start filter "YYYY-MM-DD HH:MM:SS"
+ * @param endTs    optional end filter "YYYY-MM-DD HH:MM:SS"
+ */
+export async function cmsExportLogs(
+  antenna?: string,
+  dateStr?: string,
+  startTs?: string,
+  endTs?: string,
+): Promise<void> {
+  const baseUrl = getApiBaseUrl();
+  const date = dateStr ?? new Date().toISOString().slice(0, 10);
+  const params = new URLSearchParams({ date });
+  if (antenna) params.set('antenna', antenna);
+  if (startTs) params.set('start', startTs);
+  if (endTs) params.set('end', endTs);
+
+  const url = `${baseUrl}/export_logs?${params.toString()}`;
+
+  const r = await fetch(url);
+  if (!r.ok) {
+    const text = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(`Export failed: ${text}`);
+  }
+
+  const blob = await r.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const ant = antenna ? antenna.toUpperCase() : 'LOGS';
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = `${ant}_${date}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+}
+
 /** Map backend snapshot → canvas + DSP types used by SpectrumAnalyzer. */
 export function snapshotToDetectionResult(
   snap: CmsSnapshot,

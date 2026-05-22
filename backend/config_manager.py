@@ -175,13 +175,23 @@ class AuthorizedFrequencyManager:
             print(f"[CONFIG] Save error: {exc}")
 
     def is_authorized(self, freq_hz: float, antenna_id: str | None = None) -> bool:
+        """Check if freq_hz is authorized by center-frequency proximity only.
+
+        A carrier is UNAUTHORIZED only if its center frequency is NOT within
+        AUTH_TOLERANCE_HZ of any authorized IF center frequency.
+        Carrier bandwidth is completely ignored — only center-to-center
+        distance matters. This prevents wide carriers from being falsely
+        flagged as unauthorized just because their edges drift.
+        """
+        # Safe region: ±1 MHz around each authorized IF center.
+        # Tune this value if needed — wider = more tolerant of frequency drift.
+        AUTH_TOLERANCE_HZ = 1_000_000   # ±1 MHz
+
         aid = _normalize_antenna_id(antenna_id or self.get_active_antenna())
         with self._lock:
             self._reload_if_changed()
             for entry in self._frequencies_by_antenna.get(aid, []):
-                c = entry["center"]
-                half_bw = entry["bandwidth"] / 2.0
-                if (c - half_bw) <= freq_hz <= (c + half_bw):
+                if abs(freq_hz - entry["center"]) <= AUTH_TOLERANCE_HZ:
                     return True
         return False
 

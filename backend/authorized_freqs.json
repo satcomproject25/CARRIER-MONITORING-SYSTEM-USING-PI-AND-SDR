@@ -1,27 +1,22 @@
 {
   "gsat-30": [
     {
-      "center": 72000000.0,
-      "bandwidth": 500000.0,
-      "label": ""
-    },
-    {
       "center": 70000000.0,
+      "bandwidth": 13000.0,
+      "label": "MOX-SHAR"
+    },
+    {
+      "center": 66500000.0,
       "bandwidth": 500000.0,
       "label": ""
     },
     {
-      "center": 65200000.0,
+      "center": 65500000.0,
       "bandwidth": 500000.0,
       "label": ""
     },
     {
-      "center": 72800000.0,
-      "bandwidth": 500000.0,
-      "label": ""
-    },
-    {
-      "center": 74800000.0,
+      "center": 74600000.0,
       "bandwidth": 500000.0,
       "label": ""
     }

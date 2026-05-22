@@ -5,7 +5,8 @@ import time
 import zmq
 import numpy as np
 from collections import deque
-from datetime import datetime
+from datetime import datetime, date as _date
+import queue as _queue
 
 # Headless mode: no PyQt / maximized matplotlib window; detection pipeline unchanged.
 # Set SCIPY_HEADLESS=1 when started by the CMS orchestrator for frontend-only UI.
@@ -35,6 +36,17 @@ _latest_snapshot = {}
 
 API_PORT = int(os.environ.get("SCIPY_SNAPSHOT_PORT", "8766"))
 _headless_stop = threading.Event()
+
+# =========================
+# SSD LOG PATH CONFIG
+# =========================
+# Set LOG_SSD_PATH in .env (or environment) to the SSD mount point on the Pi.
+# Example: LOG_SSD_PATH=/mnt/ssd/interference_logs
+# Falls back to a local 'logs' folder next to this script if not set.
+_LOG_SSD_PATH = os.environ.get(
+    "LOG_SSD_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+)
 
 # =========================
 # CONFIG
@@ -206,6 +218,12 @@ df = HW_SAMPLE_RATE / FFT_SIZE
 from detection_confidence import ConfidenceEngine
 _conf = ConfidenceEngine(fft_size=FFT_SIZE)
 _frame_counter = 0
+
+# EMA warmup: skip detection for the first N frames so psd_avg converges
+# before any carrier/interference logging begins. Prevents false detections
+# at startup due to uninitialized smoothing buffer.
+_WARMUP_FRAMES   = 60   # ~1.2 s at 50 fps — detection is silent during this period
+_warmup_counter  = 0    # counts up; detection enabled once >= _WARMUP_FRAMES
 
 # =========================
 # ZMQ TRANSPORT LAYER — RESILIENT DISTRIBUTED DEPLOYMENT
@@ -480,7 +498,9 @@ LOG_THROTTLE_SEC = 0.5
 
 
 class HeadlessLogBuffer:
-    """In headless mode, collect the same log lines the Qt window would show."""
+    """In headless mode, collect the same log lines the Qt window would show,
+    and also print them to stdout so they appear in the terminal regardless
+    of whether the frontend is open."""
 
     def __init__(self):
         self._last_log_time = 0.0
@@ -488,6 +508,10 @@ class HeadlessLogBuffer:
 
     def append(self, msg, color="#d4d4d4"):
         self.lines.append({"msg": msg, "color": color})
+        # Always print to stdout so logs are visible without the frontend
+        print(msg, flush=True)
+        # Write to SSD Excel file (non-blocking)
+        _log_file_writer.write(msg, color, antenna=_ACTIVE_ANTENNA)
 
     def isVisible(self):
         return True
@@ -503,6 +527,186 @@ class HeadlessLogBuffer:
 
     def activateWindow(self):
         pass
+
+
+# =====================================================
+# LOG FILE WRITER — writes every log entry to a dated .xlsx on the SSD
+# Runs in a background thread; never blocks the detection pipeline.
+# =====================================================
+class LogFileWriter:
+    """
+    Background thread that drains a queue and appends structured rows to a
+    per-antenna, per-day Excel file on the SSD (or local fallback folder).
+
+    File layout:  <ssd_path>/<ANTENNA>/<ANTENNA>_YYYY-MM-DD.xlsx
+    Columns: Timestamp | Antenna | Message | Color
+
+    Per the architecture spec:
+    - One file per antenna per day (00:00 → 23:59)
+    - File stays open and appendable all day
+    - Midnight rollover is automatic
+    - Writes are batched (flush every 20 rows or on 5s idle)
+    """
+
+    def __init__(self, ssd_path: str):
+        self._ssd_path = ssd_path
+        self._queue: _queue.Queue = _queue.Queue()
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="LogFileWriter"
+        )
+        self._thread.start()
+
+    def write(self, msg: str, color: str = "#d4d4d4", antenna: str = ""):
+        """Non-blocking — puts the entry on the queue and returns immediately."""
+        ant = antenna or _ACTIVE_ANTENNA or "unknown"
+        self._queue.put_nowait((datetime.now(), ant, msg, color))
+
+    def _get_filepath(self, antenna: str, day: _date) -> str:
+        folder = os.path.join(self._ssd_path, antenna.upper())
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"{antenna.upper()}_{day.strftime('%Y-%m-%d')}.xlsx")
+
+    def _worker(self):
+        """Drain the queue and write to Excel. Handles day rollover automatically."""
+        try:
+            import openpyxl
+        except ImportError:
+            print("[LogFileWriter] openpyxl not installed — Excel logging disabled. "
+                  "Run: pip install openpyxl", flush=True)
+            return
+
+        # cache key: (antenna, date) → (workbook, worksheet, filepath)
+        _wb_cache: dict = {}
+
+        def _get_sheet(antenna: str, day: _date):
+            key = (antenna, day)
+            if key in _wb_cache:
+                return _wb_cache[key]
+            fp = self._get_filepath(antenna, day)
+            if os.path.exists(fp):
+                wb = openpyxl.load_workbook(fp)
+                ws = wb.active
+            else:
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Detection Logs"
+                ws.append(["Timestamp", "Antenna", "Message", "Color"])
+                ws.column_dimensions["A"].width = 26
+                ws.column_dimensions["B"].width = 16
+                ws.column_dimensions["C"].width = 120
+                ws.column_dimensions["D"].width = 12
+            _wb_cache[key] = (wb, ws, fp)
+            # Evict entries older than yesterday to avoid memory growth
+            today = _date.today()
+            for old_key in list(_wb_cache.keys()):
+                if old_key[1] < today:
+                    old_wb, _, old_fp = _wb_cache.pop(old_key)
+                    try:
+                        old_wb.save(old_fp)
+                    except Exception:
+                        pass
+            return _wb_cache[key]
+
+        _pending = 0
+        _FLUSH_EVERY = 20
+
+        while True:
+            try:
+                ts, ant, msg, color = self._queue.get(timeout=5.0)
+                day = ts.date()
+                wb, ws, fp = _get_sheet(ant, day)
+                ws.append([ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], ant.upper(), msg, color])
+                _pending += 1
+                if _pending >= _FLUSH_EVERY:
+                    try:
+                        wb.save(fp)
+                    except Exception as e:
+                        print(f"[LogFileWriter] Save error: {e}", flush=True)
+                    _pending = 0
+            except _queue.Empty:
+                # Flush all pending on idle
+                for key, (wb, ws, fp) in list(_wb_cache.items()):
+                    try:
+                        wb.save(fp)
+                    except Exception:
+                        pass
+                _pending = 0
+            except Exception as e:
+                print(f"[LogFileWriter] Worker error: {e}", flush=True)
+
+    def get_filepath_for_date(self, antenna: str, day: _date) -> str:
+        return self._get_filepath(antenna, day)
+
+    def get_or_create_export(self, antenna: str, day: _date,
+                              start_ts: str | None = None,
+                              end_ts: str | None = None) -> str:
+        """
+        Return path to an Excel file for download.
+        - If start_ts/end_ts are given, filters rows to that window and writes
+          a temp file.
+        - If no filter, returns the master daily file (creating an empty one
+          if it doesn't exist yet — never raises 404).
+        """
+        try:
+            import openpyxl
+        except ImportError:
+            raise RuntimeError("openpyxl not installed")
+
+        master_fp = self._get_filepath(antenna, day)
+
+        # If no time filter requested, return master file (create if missing)
+        if not start_ts and not end_ts:
+            if not os.path.exists(master_fp):
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Detection Logs"
+                ws.append(["Timestamp", "Antenna", "Message", "Color"])
+                ws.column_dimensions["A"].width = 26
+                ws.column_dimensions["B"].width = 16
+                ws.column_dimensions["C"].width = 120
+                ws.column_dimensions["D"].width = 12
+                wb.save(master_fp)
+            return master_fp
+
+        # Time-window export — filter master file rows
+        import tempfile
+        out_wb = openpyxl.Workbook()
+        out_ws = out_wb.active
+        out_ws.title = "Detection Logs"
+        out_ws.append(["Timestamp", "Antenna", "Message", "Color"])
+        out_ws.column_dimensions["A"].width = 26
+        out_ws.column_dimensions["B"].width = 16
+        out_ws.column_dimensions["C"].width = 120
+        out_ws.column_dimensions["D"].width = 12
+
+        if os.path.exists(master_fp):
+            src_wb = openpyxl.load_workbook(master_fp, read_only=True)
+            src_ws = src_wb.active
+            first_row = True
+            for row in src_ws.iter_rows(values_only=True):
+                if first_row:
+                    first_row = False
+                    continue  # skip header
+                ts_val = str(row[0]) if row[0] else ""
+                if start_ts and ts_val < start_ts:
+                    continue
+                if end_ts and ts_val > end_ts:
+                    continue
+                out_ws.append(list(row))
+            src_wb.close()
+
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".xlsx", delete=False,
+            prefix=f"{antenna.upper()}_{day.strftime('%Y-%m-%d')}_export_"
+        )
+        tmp.close()
+        out_wb.save(tmp.name)
+        return tmp.name
+
+
+# Instantiate the writer (starts its background thread immediately).
+# Works in both headless and desktop modes.
+_log_file_writer = LogFileWriter(_LOG_SSD_PATH)
 
 
 if not _HEADLESS:
@@ -544,6 +748,8 @@ if not _HEADLESS:
             if self._line_count > MAX_LOG_LINES: self._trim()
             if self.autoscroll_on:
                 sb = self.text.verticalScrollBar(); sb.setValue(sb.maximum())
+            # Write to SSD Excel file (non-blocking)
+            _log_file_writer.write(msg, color, antenna=_ACTIVE_ANTENNA)
 
         def clear_log(self):
             self.text.clear(); self._line_count = 0
@@ -603,16 +809,16 @@ def reset_hold(event):
     max_hold[:] = -np.inf; min_hold[:] = np.inf
 reset_btn.on_clicked(reset_hold)
 
-smooth_enabled = False; smooth_alpha = 0.0; psd_avg = None
+smooth_enabled = True; smooth_alpha = 0.85; psd_avg = None
 smooth_ax  = plt.axes([0.90, 0.62, 0.1, 0.04])
-smooth_btn = Button(smooth_ax, "Smooth OFF")
+smooth_btn = Button(smooth_ax, "Smooth ON")
 def toggle_smooth(event):
     global smooth_enabled; smooth_enabled = not smooth_enabled
     smooth_btn.label.set_text("Smooth ON" if smooth_enabled else "Smooth OFF")
 smooth_btn.on_clicked(toggle_smooth)
 
 slider_ax     = plt.axes([0.15, 0.02, 0.5, 0.03])
-smooth_slider = Slider(slider_ax, "Smooth", 0.0, 1.0, valinit=0.0)
+smooth_slider = Slider(slider_ax, "Smooth", 0.0, 1.0, valinit=0.85)
 def update_smooth(val):
     global smooth_alpha; smooth_alpha = val
 smooth_slider.on_changed(update_smooth)
@@ -1701,6 +1907,53 @@ def update():
     for l in ax.lines[3:]: l.remove()
 
     # =====================================================
+    # EMA WARMUP GUARD
+    # During the first _WARMUP_FRAMES frames the smoothing buffer is still
+    # converging. The spectrum is rendered normally so the graph appears
+    # immediately, but carrier/interference detection and logging are skipped
+    # to prevent false positives from an unconverged EMA.
+    # =====================================================
+    global _warmup_counter
+    if _warmup_counter < _WARMUP_FRAMES:
+        _warmup_counter += 1
+        if _HEADLESS:
+            # Compute noise/threshold so the graph renders with correct axes,
+            # but publish empty detection arrays — no false logs.
+            _smooth_taps_w = max(3, int(round(SMOOTH_BW_HZ / df))) | 1
+            _psd_s_w = np.convolve(display_psd, np.ones(_smooth_taps_w) / _smooth_taps_w, mode="same")
+            _noise_w = float(np.percentile(_psd_s_w, NF_PERCENTILE))
+            _nf_mask_w = _psd_s_w < (_noise_w + 10.0)
+            _sigma_w = float(np.std(_psd_s_w[_nf_mask_w])) if _nf_mask_w.sum() > 4 else 1.0
+            _sigma_w = max(_sigma_w, 0.3)
+            _thresh_w = _noise_w + max(2.5, CARRIER_K_SIGMA * _sigma_w)
+            _logs_tail_w = []
+            if isinstance(log_win, HeadlessLogBuffer):
+                _logs_tail_w = list(log_win.lines)[-2000:]
+            with _snapshot_lock:
+                _latest_snapshot.update({
+                    "ts": time.time(),
+                    "antenna_id": config_mgr.get_active_antenna(),
+                    "hw_center_mhz": float(HW_CENTER_FREQ) / 1e6,
+                    "display_center_mhz": float(DISPLAY_CENTER_FREQ) / 1e6,
+                    "sample_rate_mhz": float(HW_SAMPLE_RATE) / 1e6,
+                    "fft_size": int(FFT_SIZE),
+                    "noise_db": _noise_w,
+                    "detect_threshold_db": _thresh_w,
+                    "threshold_compat_db": _thresh_w,
+                    "freq_mhz": (freq_axis[::4] / 1e6).astype(float).tolist(),
+                    "psd_db": display_psd[::4].astype(float).tolist(),
+                    "carriers": [],
+                    "unauthorized": [],
+                    "interference": [],
+                    "gap_interference": [],
+                    "stable_carriers": [],
+                    "zmq_carriers": None,
+                    "unauth_count": 0,
+                    "logs": _logs_tail_w,
+                })
+        return
+
+    # =====================================================
     # CARRIER DETECTION
     # =====================================================
     smooth_taps = max(3, int(round(SMOOTH_BW_HZ / df))) | 1
@@ -2624,7 +2877,7 @@ def update():
                 })
         _logs_tail = []
         if isinstance(log_win, HeadlessLogBuffer):
-            _logs_tail = list(log_win.lines)[-400:]
+            _logs_tail = list(log_win.lines)[-2000:]
 
         with _snapshot_lock:
             _latest_snapshot.clear()
@@ -2695,6 +2948,148 @@ def _run_headless_snapshot_api():
         if "smooth_alpha" in body:
             smooth_alpha = float(body["smooth_alpha"])
         return jsonify({"smooth_enabled": smooth_enabled, "smooth_alpha": smooth_alpha})
+
+    @app.route("/api/logs_full")
+    def logs_full():
+        """Return the full in-memory log buffer (up to MAX_LOG_LINES entries).
+        Called once by the frontend on mount to restore log history after
+        navigating away and back, or after a browser refresh."""
+        if isinstance(log_win, HeadlessLogBuffer):
+            entries = list(log_win.lines)
+        else:
+            entries = []
+        return jsonify({"logs": entries, "count": len(entries)})
+
+    @app.route("/api/export_logs")
+    def export_logs():
+        """Build and stream an Excel (.xlsx) log file from the in-memory buffer.
+        Uses stdlib only (zipfile + xml) — no openpyxl needed at runtime.
+        Query params:
+          antenna  — antenna id (defaults to active antenna)
+          date     — YYYY-MM-DD label for filename (defaults to today)
+          start    — HH:MM:SS optional start time filter
+          end      — HH:MM:SS optional end time filter
+        """
+        import io, zipfile, xml.sax.saxutils as _sax
+
+        from flask import send_file
+
+        date_str = flask_request.args.get("date", _date.today().strftime("%Y-%m-%d"))
+        antenna  = flask_request.args.get("antenna", _ACTIVE_ANTENNA or "unknown")
+        start_t  = flask_request.args.get("start", None)
+        end_t    = flask_request.args.get("end",   None)
+
+        # ── collect rows from in-memory buffer ──────────────────────────────
+        entries = list(log_win.lines) if isinstance(log_win, HeadlessLogBuffer) else []
+        rows = [["Timestamp", "Antenna", "Message", "Color"]]  # header
+
+        for entry in entries:
+            msg   = entry.get("msg", "")
+            color = entry.get("color", "#d4d4d4")
+            ts_str = ""
+            if msg.startswith("["):
+                eb = msg.find("]")
+                if eb > 0:
+                    ts_str = f"{date_str} {msg[1:eb]}"
+            if start_t and ts_str and ts_str < f"{date_str} {start_t}":
+                continue
+            if end_t and ts_str and ts_str > f"{date_str} {end_t}":
+                continue
+            rows.append([ts_str or "", antenna.upper(), msg, color])
+
+        # ── minimal xlsx builder using stdlib zipfile + xml ──────────────────
+        def _esc(v):
+            return _sax.escape(str(v) if v is not None else "")
+
+        # shared strings table
+        ss_index: dict = {}
+        ss_list: list  = []
+
+        def _si(val: str) -> int:
+            if val not in ss_index:
+                ss_index[val] = len(ss_list)
+                ss_list.append(val)
+            return ss_index[val]
+
+        # build sheet XML rows
+        sheet_rows_xml = []
+        for r_idx, row in enumerate(rows, start=1):
+            cells = []
+            for c_idx, val in enumerate(row):
+                col_letter = chr(ord('A') + c_idx)
+                ref = f"{col_letter}{r_idx}"
+                si  = _si(str(val) if val is not None else "")
+                cells.append(f'<c r="{ref}" t="s"><v>{si}</v></c>')
+            sheet_rows_xml.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+
+        sheet_data = "\n".join(sheet_rows_xml)
+
+        shared_strings_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+            f' count="{len(ss_list)}" uniqueCount="{len(ss_list)}">'
+            + "".join(f"<si><t xml:space=\"preserve\">{_esc(s)}</t></si>" for s in ss_list)
+            + "</sst>"
+        )
+
+        sheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>' + sheet_data + '</sheetData>'
+            '</worksheet>'
+        )
+
+        workbook_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+            ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Detection Logs" sheetId="1" r:id="rId1"/></sheets>'
+            '</workbook>'
+        )
+
+        workbook_rels = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
+            '</Relationships>'
+        )
+
+        content_types = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+            '</Types>'
+        )
+
+        top_rels = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>'
+        )
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml",        content_types)
+            zf.writestr("_rels/.rels",                top_rels)
+            zf.writestr("xl/workbook.xml",            workbook_xml)
+            zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+            zf.writestr("xl/worksheets/sheet1.xml",   sheet_xml)
+            zf.writestr("xl/sharedStrings.xml",       shared_strings_xml)
+        buf.seek(0)
+
+        fname = f"{antenna.upper()}_{date_str}.xlsx"
+        return send_file(
+            buf,
+            as_attachment=True,
+            download_name=fname,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     import logging as _logging
     _logging.getLogger("werkzeug").setLevel(_logging.ERROR)

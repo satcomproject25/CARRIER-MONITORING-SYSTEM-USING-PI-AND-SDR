@@ -16,6 +16,8 @@ import {
   cmsFetchSnapshot,
   cmsHealth,
   cmsSetSmoothing,
+  cmsGetFullLogs,
+  cmsExportLogs,
   snapshotToDetectionResult,
   setApiTarget,
 } from '@/lib/cmsApi';
@@ -37,14 +39,16 @@ export const SignalMonitor = () => {
   const [enableIntf, setEnableIntf] = useState(true);
   const [enableMaxHold, setEnableMaxHold] = useState(false);
   const [enableMinHold, setEnableMinHold] = useState(false);
-  const [smoothEnabled, setSmoothEnabled] = useState(false);
-  const [smoothAlpha, setSmoothAlpha] = useState(0.0);
+  const [smoothEnabled, setSmoothEnabled] = useState(true);
+  const [smoothAlpha, setSmoothAlpha] = useState(0.85);
 
   const maxHoldRef = useRef<Float64Array | null>(null);
   const minHoldRef = useRef<Float64Array | null>(null);
   const psdAvgRef = useRef<Float64Array | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval>>();
   const frameCountRef = useRef(0);
+  // Tracks whether we've already done the one-time full-log restore on mount
+  const logRestoredRef = useRef(false);
 
   const [latestMetrics, setLatestMetrics] = useState<SignalData | undefined>();
   const [authorizedList, setAuthorizedList] = useState<Array<{ center: number; bandwidth: number; label?: string }>>([]);
@@ -84,6 +88,24 @@ export const SignalMonitor = () => {
   useEffect(() => {
     void refreshAuthorized();
   }, [refreshAuthorized]);
+
+  // One-time full log restore on mount — fetches the entire in-memory buffer
+  // from the backend so logs survive navigation, antenna switching, and browser refresh.
+  useEffect(() => {
+    if (!isLiveBackend || logRestoredRef.current) return;
+    logRestoredRef.current = true;
+    void cmsGetFullLogs().then((entries) => {
+      if (entries.length === 0) return;
+      setLogs(
+        entries.map((l) => ({
+          time: '',
+          message: l.msg,
+          color: l.color ?? '#d4d4d4',
+          type: 'info' as const,
+        })),
+      );
+    });
+  }, [isLiveBackend]);
 
   // Sync smoothing controls to backend so detection is affected, not just visuals
   useEffect(() => {
@@ -254,7 +276,7 @@ export const SignalMonitor = () => {
 
         const tail = snap.logs ?? [];
         setLogs(
-          tail.slice(-400).map((l) => ({
+          tail.slice(-2000).map((l) => ({
             time: '',
             message: l.msg,
             color: l.color ?? '#d4d4d4',
@@ -364,7 +386,7 @@ export const SignalMonitor = () => {
         </div>
 
         <div style={{ height: 280 }}>
-          <DetectionLog logs={logs} onClear={() => setLogs([])} />
+          <DetectionLog logs={logs} onClear={() => setLogs([])} isLiveBackend={isLiveBackend} antennaId={antennaId} />
         </div>
 
         <div className="glass-card p-4">
@@ -377,6 +399,8 @@ export const SignalMonitor = () => {
           <p className="text-[11px] text-muted-foreground mb-3">
             Per-antenna authorization list. Values tuned for this antenna are isolated from others.
           </p>
+
+          {/* ── Manual entry row ── */}
           <div className="grid grid-cols-1 md:grid-cols-5 gap-2 mb-3">
             <input
               className="bg-secondary/30 border border-border/40 rounded-md px-2 py-2 text-xs font-mono"
@@ -392,7 +416,7 @@ export const SignalMonitor = () => {
             />
             <input
               className="bg-secondary/30 border border-border/40 rounded-md px-2 py-2 text-xs font-mono md:col-span-2"
-              placeholder="Label (optional)"
+              placeholder="Label (optional, e.g. MOX-SHAR)"
               value={authLabel}
               onChange={(e) => setAuthLabel(e.target.value)}
             />
@@ -417,6 +441,103 @@ export const SignalMonitor = () => {
               Add CF
             </Button>
           </div>
+
+          {/* ── Excel import row ── */}
+          <div className="flex items-center gap-3 mb-4 p-3 rounded-md border border-border/30 bg-secondary/10">
+            <div className="flex-1">
+              <p className="text-[11px] font-mono text-foreground mb-0.5">Import from Excel</p>
+              <p className="text-[10px] text-muted-foreground">
+                Columns required: <span className="text-primary font-mono">Tx Station</span>, <span className="text-primary font-mono">Rx Station</span>, <span className="text-primary font-mono">IF Frequency (MHz)</span>. Label = TX-RX.
+              </p>
+            </div>
+            <label className="cursor-pointer">
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                className="hidden"
+                disabled={authBusy}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  e.target.value = '';   // reset so same file can be re-imported
+                  setAuthBusy(true);
+                  try {
+                    // Dynamically import xlsx (already in package.json)
+                    const XLSX = await import('xlsx');
+                    const buf = await file.arrayBuffer();
+                    const wb = XLSX.read(buf, { type: 'array' });
+                    const ws = wb.Sheets[wb.SheetNames[0]];
+                    // raw:false → all values as strings; defval:'' → empty cells as ''
+                    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: '', raw: false });
+
+                    if (rows.length === 0) {
+                      setImportStatus('✗ No data rows found in the Excel file.');
+                      setAuthBusy(false);
+                      return;
+                    }
+
+                    // Find columns case-insensitively, trimming whitespace from keys
+                    const findCol = (row: Record<string, unknown>, ...candidates: string[]) => {
+                      const keys = Object.keys(row);
+                      for (const c of candidates) {
+                        const k = keys.find(k => k.trim().toLowerCase() === c.toLowerCase());
+                        if (k) return String(row[k] ?? '').trim();
+                      }
+                      return '';
+                    };
+
+                    let added = 0;
+                    let skipped = 0;
+                    for (const row of rows) {
+                      const tx   = findCol(row, 'tx station', 'tx_station', 'txstation', 'tx');
+                      const rx   = findCol(row, 'rx station', 'rx_station', 'rxstation', 'rx');
+                      const ifMhz = findCol(row,
+                        'if frequency (mhz)', 'if frequency', 'if freq (mhz)', 'if freq',
+                        'if_frequency_mhz', 'if_freq_mhz', 'if (mhz)', 'if',
+                        'central freq', 'central frequency', 'center freq', 'center frequency',
+                        'centre freq', 'centre frequency', 'cf (mhz)', 'cf',
+                        'frequency (mhz)', 'frequency', 'freq (mhz)', 'freq'
+                      );
+                      const bwRaw = findCol(row,
+                        'data rate (kbps)', 'data rate', 'datarate', 'data_rate',
+                        'bandwidth (khz)', 'bw (khz)', 'bw', 'bandwidth'
+                      );
+
+                      const centerMhz = parseFloat(ifMhz);
+                      if (!isFinite(centerMhz) || centerMhz <= 0) { skipped++; continue; }
+
+                      // Derive BW from data rate if available (rough: 1.2 × data_rate kHz), else default 500 kHz
+                      let bwKhz = 500;
+                      const drKbps = parseFloat(bwRaw);
+                      if (isFinite(drKbps) && drKbps > 0) bwKhz = Math.round(drKbps * 1.2);
+
+                      const label = [tx, rx].filter(Boolean).join('-') || `CF-${centerMhz}`;
+
+                      await cmsAddAuthorizedFrequency(antennaId, centerMhz * 1e6, bwKhz * 1e3, label);
+                      added++;
+                    }
+
+                    await refreshAuthorized();
+                    setImportStatus(`✓ ${added} frequencies imported${skipped ? ` (${skipped} skipped — no valid central freq)` : ''}`);
+                    setTimeout(() => { void refreshAuthorized(); }, 600);
+                  } catch (err) {
+                    setImportStatus(`✗ Import failed: ${err instanceof Error ? err.message : String(err)}`);
+                  } finally {
+                    setAuthBusy(false);
+                  }
+                }}
+              />
+              <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border text-[11px] font-mono transition-colors ${
+                authBusy
+                  ? 'border-border/20 text-muted-foreground/40 cursor-not-allowed'
+                  : 'border-primary/40 text-primary hover:bg-primary/10 cursor-pointer'
+              }`}>
+                📂 Choose Excel File
+              </span>
+            </label>
+          </div>
+
+          {/* ── Frequency table ── */}
           <div className="max-h-48 overflow-auto border border-border/30 rounded-md">
             <table className="w-full text-xs font-mono">
               <thead className="bg-secondary/30 text-muted-foreground">
