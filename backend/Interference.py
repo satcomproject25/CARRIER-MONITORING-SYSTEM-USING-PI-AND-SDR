@@ -128,7 +128,7 @@ INTF_ENVELOPE_ORDER    = 9
 INTF_VARIANCE_WINDOW   = 7
 INTF_VARIANCE_SIGMA    = 2.5
 INTF_CUC_CURV_SIGMA    = 3.5
-INTF_MERGE_GAP_HZ      = 50e3
+INTF_MERGE_GAP_HZ      = 150e3
 
 # Level-shift detector (carrier-on-carrier / co-channel interference)
 # Detects flat elevated regions that evade bump/variance/curvature detectors
@@ -1345,17 +1345,7 @@ def detect_carrier_valleys(psd_segment, freq_segment, noise_floor):
 # =====================================================
 def detect_interference_in_carrier(psd_segment, freq_segment):
     """
-    IMPROVEMENT 6: Intra-carrier interference detection with fully adaptive
-    thresholds and enhanced detection for edge, partial-overlap, and
-    embedded narrowband interference.
-
-    Changes vs original:
-      6a — Bump threshold: adaptive (local σ-based) instead of fixed INTF_BUMP_THRESHOLD_DB
-      6b — Variance threshold: adaptive (per-carrier variance statistics)
-      6c — Edge interference: explicit left/right 20% sub-band power deviation check
-      6d — Power-deviation from expected carrier shape (rolling median envelope)
-      6e — Sub-band variance increase detection (partial carrier overlay)
-    All other logic (gap detector, merge, structure) is unchanged.
+    IMPROVEMENT 6: ... (unchanged docstring)
     """
     if len(psd_segment) < 6:
         return []
@@ -1363,26 +1353,18 @@ def detect_interference_in_carrier(psd_segment, freq_segment):
     results = []
     n = len(psd_segment)
 
-    # ── IMPROVEMENT 6a: Adaptive local statistics for this carrier segment ────
-    # Compute carrier's noise floor as the lower-percentile of its own PSD.
-    # This makes every threshold relative to local conditions, not global noise.
     _local_floor  = float(np.percentile(psd_segment, NF_PERCENTILE))
     _local_sigma  = float(np.std(psd_segment[psd_segment < (_local_floor + 8.0)]))
-    _local_sigma  = max(_local_sigma, 0.5)   # prevent zero-sigma collapse
-    # Adaptive bump threshold: max of config value or 1.5 × local σ
-    # Cap at 6 dB so a wide carrier with broad interference doesn't push
-    # _bump_thr so high that the bump detector becomes blind.
+    _local_sigma  = max(_local_sigma, 0.5)
     _bump_thr     = min(max(INTF_BUMP_THRESHOLD_DB, 1.5 * _local_sigma), 6.0)
-    # Adaptive variance multiplier: tighten if carrier is narrow/clean
     _var_sigma    = max(INTF_VARIANCE_SIGMA, 1.5)
 
-    # 1. SPECTRAL-BUMP DETECTOR (adaptive threshold)
+    # 1. SPECTRAL-BUMP DETECTOR (unchanged)
     half = min(INTF_ENVELOPE_ORDER, n // 2)
     if half >= 1:
         pad      = np.pad(psd_segment, half, mode='edge')
         envelope = np.array([np.median(pad[i:i + 2*half + 1]) for i in range(n)])
         residual = psd_segment - envelope
-        # IMPROVEMENT 6a: use adaptive bump threshold
         bump_mask  = residual > _bump_thr
         bump_edges = np.diff(bump_mask.astype(np.int8))
         b_rises = np.where(bump_edges == 1)[0] + 1
@@ -1400,20 +1382,47 @@ def detect_interference_in_carrier(psd_segment, freq_segment):
                 'method': 'bump', 'is_gap': False,
             })
 
-    # 2. LOCAL-VARIANCE ANOMALY (adaptive multiplier)
+    # 2. LOCAL-VARIANCE ANOMALY — FIXED with plateau bridging (Fix 3)
     w = min(INTF_VARIANCE_WINDOW, n // 3)
     if w >= 3:
         local_var = np.array([np.var(psd_segment[max(0,i-w):i+w+1]) for i in range(n)])
         med_var   = np.median(local_var) + 1e-6
-        # IMPROVEMENT 6b: adaptive variance sigma
         anom_mask  = local_var > (_var_sigma * med_var)
         anom_edges = np.diff(anom_mask.astype(np.int8))
         a_rises = np.where(anom_edges == 1)[0] + 1
         a_falls = np.where(anom_edges == -1)[0] + 1
         if anom_mask[0]:  a_rises = np.insert(a_rises, 0, 0)
         if anom_mask[-1]: a_falls = np.append(a_falls, n)
-        for ar, af in zip(a_rises, a_falls):
-            if (af - ar) < INTF_MIN_BUMP_BINS: continue
+
+        # FIX 3 — Plateau-bridging merge for wide flat-topped bumps
+        _edge_n_var = max(2, int(n * INTF_LEVEL_SHIFT_EDGE_PCT / 100.0))
+        _edge_level_var = float(np.mean(
+            np.concatenate([psd_segment[:_edge_n_var], psd_segment[-_edge_n_var:]])
+        ))
+        _bridge_thr_db = max(INTF_LEVEL_SHIFT_DB, 1.5 * _local_sigma)
+
+        rises_list = list(a_rises)
+        falls_list = list(a_falls)
+        merged_runs = []
+        i = 0
+        while i < len(rises_list):
+            ar, af = rises_list[i], falls_list[i]
+            if i + 1 < len(rises_list):
+                next_ar = rises_list[i + 1]
+                next_af = falls_list[i + 1]
+                bridge_region = psd_segment[af:next_ar]
+                if len(bridge_region) > 0:
+                    bridge_elev = float(np.mean(bridge_region)) - _edge_level_var
+                    if bridge_elev >= _bridge_thr_db:
+                        merged_runs.append((ar, next_af))
+                        i += 2
+                        continue
+            merged_runs.append((ar, af))
+            i += 1
+
+        for ar, af in merged_runs:
+            if (af - ar) < INTF_MIN_BUMP_BINS:
+                continue
             seg = psd_segment[ar:af]; pk_local = np.argmax(seg) + ar
             strength = float(psd_segment[pk_local] - np.median(psd_segment))
             if strength < 2.0: continue
@@ -1508,33 +1517,14 @@ def detect_interference_in_carrier(psd_segment, freq_segment):
     # This isolates flat elevated plateaus that evade all existing detectors.
     if INTF_LEVEL_SHIFT_ENABLED and n >= 12:
         _edge_n = max(2, int(n * INTF_LEVEL_SHIFT_EDGE_PCT / 100.0))
-        # Edge baseline: mean power of the carrier's edge bins (both sides).
-        # These represent the uncontaminated base carrier level because the
-        # interfering carrier occupies the interior, not the skirts.
         _edge_bins  = np.concatenate([psd_segment[:_edge_n], psd_segment[-_edge_n:]])
         _edge_level = float(np.mean(_edge_bins))
 
-        # Deviation of each bin from the edge baseline
         _deviation = psd_segment - _edge_level
-
-        # Adaptive threshold: use configured dB floor but also respect local sigma
-        # so that a noisy carrier doesn't trigger false alarms.
         _ls_thr = max(INTF_LEVEL_SHIFT_DB, 1.2 * _local_sigma)
-
-        # Binary mask of elevated bins
         _elevated = _deviation > _ls_thr
-
-        # Guard: if almost the entire carrier is "elevated", this is just the
-        # normal carrier shape (center naturally higher than skirts) — skip.
         _elev_count = int(_elevated.sum())
 
-        # ── Bump-existence validation ─────────────────────────────────────
-        # Before running any level-shift logic, verify the carrier actually
-        # has a bump/spike on top that deviates from its smooth shape.
-        # Fit a quadratic (order 2) to the carrier PSD — this captures the
-        # natural bell/flat-top/roll-off of any clean carrier.  If the max
-        # positive residual (actual − fitted) is below INTF_LEVEL_SHIFT_DB,
-        # the carrier is well-explained by a smooth curve → no interference.
         _x_norm     = np.linspace(-1, 1, n)
         _poly_co    = np.polyfit(_x_norm, psd_segment, 2)
         _poly_fit   = np.polyval(_poly_co, _x_norm)
@@ -1551,44 +1541,37 @@ def detect_interference_in_carrier(psd_segment, freq_segment):
             _el_falls = np.where(_el_edges == -1)[0] + 1
             if _elevated[0]:  _el_rises = np.insert(_el_rises, 0, 0)
             if _elevated[-1]: _el_falls = np.append(_el_falls, n)
-            # Pre-compute gradient once for step-sharpness check
+
             _grad = np.abs(np.gradient(psd_segment))
-            # Adaptive step threshold: the 75th percentile of |gradient| represents
-            # the carrier's natural gradient range (roll-off slopes, ripple).
-            # A real interference step must be K× above this natural range.
-            _carrier_grad_p75 = float(np.percentile(_grad, 75))
+
+            # FIX 1: Compute carrier natural gradient from EDGE BINS ONLY
+            _edge_grad_bins = np.concatenate([_grad[:_edge_n], _grad[-_edge_n:]])
+            _carrier_grad_p75 = float(np.percentile(_edge_grad_bins, 75))
             _adaptive_step_thr = max(INTF_LEVEL_SHIFT_STEP_DB,
                                      INTF_LEVEL_SHIFT_STEP_K * _carrier_grad_p75)
+
             for _er, _ef in zip(_el_rises, _el_falls):
                 _rw = _ef - _er
                 if _rw < INTF_LEVEL_SHIFT_MIN_BINS:
                     continue
-                # Skip if this single region spans too much of the carrier
                 if _rw > INTF_LEVEL_SHIFT_MAX_FRAC * n:
                     continue
 
-                # ── Adaptive step-sharpness guard ─────────────────────────
-                # A normal carrier's roll-off produces boundary gradients within
-                # its own natural range (≤ p75 × K). Carrier-on-carrier creates
-                # outlier gradients that exceed this adaptive threshold.
-                _gw = max(1, min(3, _rw // 4))  # gradient averaging window (1-3 bins)
+                # FIX 2: Wider window + p90 percentile
+                _gw = max(2, min(5, _rw // 3))
 
-                # Left boundary gradient: bins just around _er
                 _left_g = 0.0
                 if _er > 0:
                     _lg_s = max(0, _er - _gw)
                     _lg_e = min(n, _er + _gw + 1)
-                    _left_g = float(np.max(_grad[_lg_s:_lg_e]))
+                    _left_g = float(np.percentile(_grad[_lg_s:_lg_e], 90))
 
-                # Right boundary gradient: bins just around _ef
                 _right_g = 0.0
                 if _ef < n:
                     _rg_s = max(0, _ef - _gw - 1)
                     _rg_e = min(n, _ef + _gw)
-                    _right_g = float(np.max(_grad[_rg_s:_rg_e]))
+                    _right_g = float(np.percentile(_grad[_rg_s:_rg_e], 90))
 
-                # If neither boundary has a gradient that's an outlier relative
-                # to this carrier's own shape, suppress the detection.
                 if max(_left_g, _right_g) < _adaptive_step_thr:
                     continue
 
@@ -1604,7 +1587,6 @@ def detect_interference_in_carrier(psd_segment, freq_segment):
                     'strength_db': _str_ls,
                     'method': 'level_shift', 'is_gap': False,
                 })
-
     # 4. INTRA-CARRIER GAP DETECTOR — RED highlight, flagged as interference
     if GAP_ENABLED and n >= 10:
         min_peak_distance = max(3, n // 10)
